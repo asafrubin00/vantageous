@@ -104,7 +104,7 @@ export default function App() {
   const [section, setSection] = useState('Home');
   const [activeFilter, setActiveFilter] = useState(null);
   const [articles, setArticles] = useState([]);
-  const [homeArticles, setHomeArticles] = useState([]);
+  const [allArticles, setAllArticles] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
@@ -120,6 +120,12 @@ export default function App() {
     return res.json();
   }, []);
 
+  const fetchAllFeeds = useCallback(async () => {
+    const res = await fetch('/api/briefing?mode=all');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }, []);
+
   const fetchBriefing = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -127,18 +133,13 @@ export default function App() {
       const data = await fetchFeed(section.toLowerCase());
       setArticles(data);
       setLastUpdated(new Date());
-
-      if (section.toLowerCase() === 'home') {
-        setHomeArticles(data);
-      } else {
-        fetchFeed('home').then(setHomeArticles).catch(() => {});
-      }
+      fetchAllFeeds().then(setAllArticles).catch(() => {});
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
     }
-  }, [section, fetchFeed]);
+  }, [section, fetchFeed, fetchAllFeeds]);
 
   useEffect(() => {
     setActiveFilter(null);
@@ -192,7 +193,7 @@ export default function App() {
   let displayedArticles = articles;
   if (activeFilter) {
     if (activeFilter.type === 'keyword') {
-      displayedArticles = homeArticles.filter((a) =>
+      displayedArticles = allArticles.filter((a) =>
         matchesKeywords(a, activeFilter.keywords)
       );
     }
