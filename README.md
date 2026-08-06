@@ -32,11 +32,43 @@ Trending tickers and sources are accessible from the filter bar without clutteri
 
 A second mode provides a clean reading surface for the underlying news, with FT section tabs (Home, Markets, UK, World, Opinion, Tech) and a custom keyword filter system. Saved filters are stored in localStorage.
 
+## Valuation mode
+
+A discounted cash flow calculator for US-listed stocks. Enter a ticker, set your assumptions
+— discount rate, initial free cash flow growth, terminal growth, forecast length, and which
+cash flow basis to anchor on — and it returns a fair value per share against the live price.
+
+Alongside the point estimate it shows:
+
+- **Reverse DCF** — the growth rate today's price already implies. Usually more informative
+  than the fair value itself, since it turns the question into one you can judge directly.
+- **Sensitivity grid** — fair value across a range of discount rates and terminal growth
+  rates. A DCF point estimate is one cell in a table that often spans 2–3x.
+- **Free cash flow history**, and every model input with the XBRL tag it came from, so a bad
+  extraction is visible rather than silent.
+
+Fundamentals are pulled from SEC EDGAR's XBRL `companyfacts` API and the trailing-twelve-month
+figure is rolled forward from interim filings, since the last 10-K can be nearly a year old.
+
+The endpoint declines rather than guessing when a DCF would be invalid:
+
+- **Banks and insurers** do not tag capital expenditure, so free cash flow cannot be built —
+  a dividend discount or residual income model is the right tool for those.
+- **Filers whose capex coverage has gone stale** (common for REITs, which tag property
+  acquisitions rather than maintenance capex) would otherwise mix decade-old investment spend
+  with a current balance sheet.
+- **Negative free cash flow**, thin filing history, and terminal-value-dominated results are
+  flagged explicitly.
+
+Coverage is US SEC filers only.
+
 ## Stack
 
 - Front end: React + Vite + Tailwind CSS
 - AI analysis: Claude Sonnet via the Anthropic API
 - Analyst ratings: Finnhub API
+- Fundamentals: SEC EDGAR XBRL `companyfacts` (no key required)
+- Prices: Yahoo Finance chart endpoint (no key required)
 - News sources: RSS feeds parsed server-side via `rss-parser`
 - Deployment: Vercel serverless functions
 
@@ -47,9 +79,10 @@ A second mode provides a clean reading surface for the underlying news, with FT 
 ├── api/
 │   ├── signals.js       # fetches RSS feeds, runs Claude analysis, returns structured signals
 │   ├── briefing.js      # fetches individual FT section feeds and keyword-filtered feeds
-│   └── rating.js        # proxies Finnhub analyst consensus ratings with 24h caching
+│   ├── rating.js        # proxies Finnhub analyst consensus ratings with 24h caching
+│   └── dcf.js           # SEC EDGAR fundamentals + DCF, reverse DCF, and sensitivity grid
 ├── src/
-│   └── App.jsx          # full single-file React app — signals view, briefing view, filter bar
+│   └── App.jsx          # full single-file React app — signals, briefing, valuation, filter bar
 ├── index.html
 ├── vite.config.js
 ├── tailwind.config.js
@@ -84,6 +117,8 @@ The app will be available at `http://localhost:3000`.
 ## Caching
 
 Signal analysis is cached for 30 minutes at the CDN layer (`s-maxage=1800`) to avoid redundant Claude API calls. Analyst ratings are cached for 24 hours. The Briefing feed refreshes every 20 minutes client-side.
+DCF results are cached for an hour per ticker-and-assumption combination, and the valuation view
+debounces assumption changes so dragging a slider fires one request rather than thirty.
 
 ## Notes on sources
 

@@ -1,0 +1,475 @@
+// Discounted cash flow valuation for US-listed filers.
+//
+// Fundamentals come from SEC EDGAR's XBRL companyfacts API (free, no key, but the
+// tagging is inconsistent between filers so every metric needs a fallback chain).
+// Spot price comes from Yahoo's chart endpoint.
+
+const UA = 'Vantageous DCF (rubin.asaf01@gmail.com)';
+const DAY = 86400_000;
+
+// Tag fallback chains, in priority order. First hit wins — these are alternatives
+// for the same line item, not components to be summed.
+const TAGS = {
+  ocf: [
+    'NetCashProvidedByUsedInOperatingActivities',
+    'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
+  ],
+  capex: [
+    'PaymentsToAcquirePropertyPlantAndEquipment',
+    'PaymentsToAcquireProductiveAssets',
+    'PaymentsForCapitalImprovements',
+    'PaymentsToAcquireOtherPropertyPlantAndEquipment',
+  ],
+  cash: [
+    'CashAndCashEquivalentsAtCarryingValue',
+    'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents',
+  ],
+  shortTermInvestments: [
+    'ShortTermInvestments',
+    'MarketableSecuritiesCurrent',
+    'AvailableForSaleSecuritiesDebtSecuritiesCurrent',
+    'OtherShortTermInvestments',
+  ],
+  longTermDebt: [
+    'LongTermDebtNoncurrent',
+    'LongTermDebtAndCapitalLeaseObligations',
+    'LongTermDebt',
+  ],
+  shortTermDebt: ['LongTermDebtCurrent', 'DebtCurrent', 'ShortTermBorrowings'],
+  dilutedShares: ['WeightedAverageNumberOfDilutedSharesOutstanding'],
+  coverShares: ['EntityCommonStockSharesOutstanding'],
+};
+
+// Ordinary synonyms for capital expenditure. Anything outside this set is a
+// narrower line item (REIT capital improvements, for one) that understates real
+// investment spend, so it is worth flagging when it ends up driving the model.
+const STANDARD_CAPEX = new Set([
+  'PaymentsToAcquirePropertyPlantAndEquipment',
+  'PaymentsToAcquireProductiveAssets',
+  'PaymentsToAcquireOtherPropertyPlantAndEquipment',
+]);
+
+let tickerMapCache = null;
+
+async function tickerToCik(ticker) {
+  if (!tickerMapCache) {
+    const r = await fetch('https://www.sec.gov/files/company_tickers.json', {
+      headers: { 'User-Agent': UA },
+    });
+    if (!r.ok) throw new Error(`SEC ticker map unavailable (${r.status})`);
+    const raw = await r.json();
+    tickerMapCache = new Map(
+      Object.values(raw).map((e) => [e.ticker.toUpperCase(), { cik: e.cik_str, name: e.title }])
+    );
+  }
+  // EDGAR writes class shares as BRK-B; people type BRK.B.
+  return tickerMapCache.get(ticker.toUpperCase()) || tickerMapCache.get(ticker.toUpperCase().replace('.', '-'));
+}
+
+async function companyFacts(cik) {
+  const padded = String(cik).padStart(10, '0');
+  const r = await fetch(`https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`, {
+    headers: { 'User-Agent': UA },
+  });
+  if (!r.ok) throw new Error(`No EDGAR filings found (${r.status})`);
+  return r.json();
+}
+
+// Filers switch tags mid-history — NVDA reports capex under
+// PaymentsToAcquirePropertyPlantAndEquipment through 2012 and
+// PaymentsToAcquireProductiveAssets from 2022. Taking only the first tag that
+// exists would silently truncate the series to a dead decade, so merge every tag
+// in the chain and let priority settle the periods where they overlap.
+function resolve(facts, chain, unit) {
+  const entries = [];
+  chain.forEach((tag, prio) => {
+    for (const ns of ['us-gaap', 'dei']) {
+      const found = facts[ns]?.[tag]?.units?.[unit];
+      if (found?.length) entries.push(...found.map((e) => ({ ...e, tag, prio })));
+    }
+  });
+  return entries.length ? { entries } : null;
+}
+
+// A given period appears in several filings — restated in later 10-Ks, and possibly
+// under more than one tag. Prefer the higher-priority tag, then the latest filing.
+function better(a, b) {
+  if (!a) return b;
+  if (a.prio !== b.prio) return a.prio < b.prio ? a : b;
+  return a.filed > b.filed ? a : b;
+}
+
+function dedupeByPeriod(entries, keyFn) {
+  const best = new Map();
+  for (const e of entries) {
+    const k = keyFn(e);
+    best.set(k, better(best.get(k), e));
+  }
+  return [...best.values()];
+}
+
+function annualSeries(entries) {
+  const annual = entries.filter((e) => {
+    if (e.form !== '10-K' || !e.start) return false;
+    const days = (Date.parse(e.end) - Date.parse(e.start)) / DAY;
+    return days >= 330 && days <= 400; // exclude quarterly rows carried inside a 10-K
+  });
+  return dedupeByPeriod(annual, (e) => `${e.start}:${e.end}`).sort((a, b) => a.end.localeCompare(b.end));
+}
+
+// The last 10-K can be nearly a year old. Roll it forward using year-to-date figures
+// from the interim filings: TTM = last full year + current YTD - prior-year same YTD.
+function trailingTwelveMonths(entries, latestAnnual) {
+  if (!latestAnnual) return null;
+  const durations = dedupeByPeriod(
+    entries.filter((e) => e.start),
+    (e) => `${e.start}:${e.end}`
+  );
+
+  const ytd = durations
+    .filter((e) => e.end > latestAnnual.end && Date.parse(e.end) - Date.parse(e.start) < 360 * DAY)
+    .sort((a, b) => b.end.localeCompare(a.end))[0];
+  if (!ytd) return null;
+
+  const span = Date.parse(ytd.end) - Date.parse(ytd.start);
+  const priorEnd = Date.parse(ytd.end) - 365 * DAY;
+  const prior = durations.find(
+    (e) =>
+      Math.abs(Date.parse(e.end) - priorEnd) < 20 * DAY &&
+      Math.abs(Date.parse(e.end) - Date.parse(e.start) - span) < 20 * DAY
+  );
+  if (!prior) return null;
+
+  return { val: latestAnnual.val + ytd.val - prior.val, through: ytd.end, ytdSpanDays: Math.round(span / DAY) };
+}
+
+function latestInstant(entries) {
+  const instants = dedupeByPeriod(entries.filter((e) => !e.start), (e) => e.end);
+  if (!instants.length) return null;
+  return instants.sort((a, b) => b.end.localeCompare(a.end))[0];
+}
+
+async function spotPrice(ticker) {
+  const r = await fetch(
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1d`,
+    { headers: { 'User-Agent': 'Mozilla/5.0' } }
+  );
+  if (!r.ok) return null;
+  const meta = (await r.json())?.chart?.result?.[0]?.meta;
+  if (!meta?.regularMarketPrice) return null;
+  return { price: meta.regularMarketPrice, currency: meta.currency, exchange: meta.fullExchangeName };
+}
+
+// Growth fades linearly from the initial rate to the terminal rate across the
+// forecast window, rather than stepping off a cliff in the final year.
+function growthPath(initial, terminal, years) {
+  return Array.from({ length: years }, (_, i) =>
+    years === 1 ? terminal : initial + ((terminal - initial) * i) / (years - 1)
+  );
+}
+
+function valueFrom(baseFcf, path, wacc, terminalGrowth, netDebt, shares) {
+  let fcf = baseFcf;
+  let pvExplicit = 0;
+  const rows = [];
+
+  path.forEach((g, i) => {
+    const year = i + 1;
+    fcf = fcf * (1 + g);
+    const discount = (1 + wacc) ** year;
+    const pv = fcf / discount;
+    pvExplicit += pv;
+    rows.push({ year, growth: g, fcf, pv });
+  });
+
+  const terminalValue = (fcf * (1 + terminalGrowth)) / (wacc - terminalGrowth);
+  const pvTerminal = terminalValue / (1 + wacc) ** path.length;
+  const enterpriseValue = pvExplicit + pvTerminal;
+  const equityValue = enterpriseValue - netDebt;
+
+  return {
+    rows,
+    pvExplicit,
+    terminalValue,
+    pvTerminal,
+    enterpriseValue,
+    equityValue,
+    perShare: equityValue / shares,
+    terminalShare: pvTerminal / enterpriseValue,
+  };
+}
+
+// What initial growth rate would justify today's price? Monotonic in growth, so bisect.
+function impliedGrowth(price, baseFcf, terminal, years, wacc, netDebt, shares) {
+  const perShareAt = (g) =>
+    valueFrom(baseFcf, growthPath(g, terminal, years), wacc, terminal, netDebt, shares).perShare;
+
+  let lo = -0.5;
+  let hi = 1.0;
+  if (perShareAt(lo) > price || perShareAt(hi) < price) return null; // price outside solvable range
+
+  for (let i = 0; i < 80; i++) {
+    const mid = (lo + hi) / 2;
+    if (perShareAt(mid) < price) lo = mid;
+    else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+export default async function handler(req, res) {
+  const { ticker } = req.query;
+  if (!ticker) return res.status(400).json({ error: 'ticker required' });
+
+  const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
+  const wacc = num(req.query.wacc, 9) / 100;
+  const terminalGrowth = num(req.query.terminalGrowth, 2.5) / 100;
+  const initialGrowth = num(req.query.growth, 8) / 100;
+  const years = Math.min(Math.max(Math.round(num(req.query.years, 10)), 1), 20);
+  const basis = req.query.basis === 'avg3' || req.query.basis === 'lastFy' ? req.query.basis : 'ttm';
+
+  if (wacc <= terminalGrowth) {
+    return res.status(400).json({
+      error: 'Discount rate must exceed terminal growth, otherwise terminal value is infinite.',
+    });
+  }
+
+  try {
+    const match = await tickerToCik(ticker);
+    if (!match) {
+      return res.status(404).json({ error: `${ticker.toUpperCase()} is not a US SEC filer — this tool covers US-listed stocks only.` });
+    }
+
+    const { facts } = await companyFacts(match.cik);
+    const warnings = [];
+    const sources = {};
+
+    const ocfRef = resolve(facts, TAGS.ocf, 'USD');
+    if (!ocfRef) return res.status(422).json({ error: 'No operating cash flow reported in EDGAR for this filer.' });
+
+    const capexRef = resolve(facts, TAGS.capex, 'USD');
+    if (!capexRef) {
+      return res.status(422).json({
+        error: `${match.name} does not report capital expenditure — typical of banks and insurers.`,
+        detail:
+          'Free-cash-flow DCF is not a valid model for financials. A dividend discount or residual income model is the right approach for this filer.',
+        ticker: ticker.toUpperCase(),
+        company: match.name,
+      });
+    }
+    const ocfAnnual = annualSeries(ocfRef.entries);
+    const capexAnnual = annualSeries(capexRef.entries);
+    if (!ocfAnnual.length || !capexAnnual.length) {
+      return res.status(422).json({ error: 'No annual (10-K) cash flow history found for this filer.' });
+    }
+
+    // Pair the two series by fiscal period end so a missing year can't misalign them.
+    const capexByEnd = new Map(capexAnnual.map((e) => [e.end, e]));
+    const history = ocfAnnual
+      .filter((o) => capexByEnd.has(o.end))
+      .map((o) => {
+        const c = capexByEnd.get(o.end);
+        const capex = Math.abs(c.val);
+        return { periodEnd: o.end, operatingCashFlow: o.val, capex, freeCashFlow: o.val - capex, capexTag: c.tag };
+      });
+
+    if (!history.length) return res.status(422).json({ error: 'Could not align cash flow and capex periods.' });
+    if (history.length < 3) warnings.push(`Only ${history.length} year(s) of filing history available — growth assumptions have little to anchor to.`);
+
+    const latestFy = history[history.length - 1];
+    sources.operatingCashFlow = ocfAnnual[ocfAnnual.length - 1].tag;
+    sources.capex = latestFy.capexTag;
+
+    // A filer can keep reporting cash flow long after it stops tagging capex —
+    // Prologis dropped PaymentsForCapitalImprovements after 2018. Valuing recent
+    // cash against decade-old investment spend would be worse than not answering.
+    const latestOcfYear = +ocfAnnual[ocfAnnual.length - 1].end.slice(0, 4);
+    const capexLagYears = latestOcfYear - +latestFy.periodEnd.slice(0, 4);
+    if (capexLagYears >= 2) {
+      return res.status(422).json({
+        error: `${match.name} last reported capital expenditure for ${latestFy.periodEnd.slice(0, 4)}, but has cash flow through ${latestOcfYear}.`,
+        detail:
+          'Free cash flow cannot be built for recent periods, so any valuation would mix stale investment spend with a current balance sheet. This is common for REITs, which tag property acquisitions rather than maintenance capex.',
+        ticker: ticker.toUpperCase(),
+        company: match.name,
+        history,
+      });
+    }
+
+    if (!STANDARD_CAPEX.has(latestFy.capexTag)) {
+      warnings.push(
+        `Capex read from the narrower tag "${latestFy.capexTag}" — this filer does not report a standard capital expenditure line, so free cash flow may be overstated.`
+      );
+    }
+
+    // Anchor both trailing calculations to the same fiscal period, or a filer whose
+    // two series end in different years would produce a spliced, meaningless TTM.
+    const ocfAnchor = ocfAnnual.find((e) => e.end === latestFy.periodEnd);
+    const capexAnchor = capexAnnual.find((e) => e.end === latestFy.periodEnd);
+    const ocfTtm = trailingTwelveMonths(ocfRef.entries, ocfAnchor);
+    const capexTtm = trailingTwelveMonths(capexRef.entries, capexAnchor);
+    const ttm =
+      ocfTtm && capexTtm && ocfTtm.through === capexTtm.through
+        ? { freeCashFlow: ocfTtm.val - Math.abs(capexTtm.val), through: ocfTtm.through }
+        : null;
+
+    const avg3 = history.slice(-3).reduce((s, h) => s + h.freeCashFlow, 0) / Math.min(3, history.length);
+
+    let baseFcf;
+    let basisUsed = basis;
+    if (basis === 'ttm' && ttm) baseFcf = ttm.freeCashFlow;
+    else if (basis === 'avg3') baseFcf = avg3;
+    else {
+      baseFcf = latestFy.freeCashFlow;
+      basisUsed = 'lastFy';
+      if (basis === 'ttm') warnings.push('Interim filings were insufficient to build a trailing-twelve-month figure; fell back to the last full fiscal year.');
+    }
+
+    const monthsStale = (Date.now() - Date.parse(latestFy.periodEnd)) / (30 * DAY);
+    if (basisUsed === 'lastFy' && monthsStale > 9) {
+      warnings.push(`Last fiscal year ended ${latestFy.periodEnd}, roughly ${Math.round(monthsStale)} months ago.`);
+    }
+
+    const cashRef = resolve(facts, TAGS.cash, 'USD');
+    const stiRef = resolve(facts, TAGS.shortTermInvestments, 'USD');
+    const ltdRef = resolve(facts, TAGS.longTermDebt, 'USD');
+    const stdRef = resolve(facts, TAGS.shortTermDebt, 'USD');
+
+    const pick = (ref) => (ref ? latestInstant(ref.entries) : null);
+    const cash = pick(cashRef);
+    const sti = pick(stiRef);
+    const ltd = pick(ltdRef);
+    const std = pick(stdRef);
+
+    sources.cash = cash?.tag ?? null;
+    sources.shortTermInvestments = sti?.tag ?? null;
+    sources.longTermDebt = ltd?.tag ?? null;
+    sources.shortTermDebt = std?.tag ?? null;
+
+    const totalCash = (cash?.val ?? 0) + (sti?.val ?? 0);
+    const totalDebt = (ltd?.val ?? 0) + (std?.val ?? 0);
+    const netDebt = totalDebt - totalCash;
+    if (!ltd && !std) warnings.push('No debt tags found in EDGAR; net debt treated as cash only.');
+
+    // Diluted weighted-average shares is the denominator that matches EPS: it covers
+    // every share class and existing dilution. The cover-page count is reported
+    // alongside it because buybacks make it drift below the weighted average.
+    const dilRef = resolve(facts, TAGS.dilutedShares, 'shares');
+    const coverRef = resolve(facts, TAGS.coverShares, 'shares');
+    const diluted = dilRef ? annualSeries(dilRef.entries).slice(-1)[0] ?? latestInstant(dilRef.entries) : null;
+    const cover = coverRef ? latestInstant(coverRef.entries) : null;
+    const shares = diluted?.val ?? cover?.val;
+    if (!shares) return res.status(422).json({ error: 'No share count reported in EDGAR for this filer.' });
+    sources.shares = diluted?.tag ?? cover?.tag;
+
+    if (baseFcf <= 0) {
+      return res.status(422).json({
+        error: `${match.name} has negative free cash flow on the selected basis — a DCF cannot produce a meaningful value.`,
+        baseFreeCashFlow: baseFcf,
+        ticker: ticker.toUpperCase(),
+        company: match.name,
+        history,
+      });
+    }
+
+    const quote = await spotPrice(ticker);
+
+    const base = valueFrom(
+      baseFcf,
+      growthPath(initialGrowth, terminalGrowth, years),
+      wacc,
+      terminalGrowth,
+      netDebt,
+      shares
+    );
+
+    // Sensitivity: the point estimate is far less informative than the spread.
+    const waccAxis = [-2, -1, 0, 1, 2].map((d) => +(wacc + d / 100).toFixed(4)).filter((w) => w > terminalGrowth);
+    const tgAxis = [-1, -0.5, 0, 0.5, 1].map((d) => +(terminalGrowth + d / 100).toFixed(4));
+    const grid = waccAxis.map((w) =>
+      tgAxis.map((g) =>
+        w <= g
+          ? null
+          : +valueFrom(baseFcf, growthPath(initialGrowth, g, years), w, g, netDebt, shares).perShare.toFixed(2)
+      )
+    );
+
+    const price = quote?.price ?? null;
+    const upside = price ? base.perShare / price - 1 : null;
+    let verdict = null;
+    if (upside !== null) {
+      if (upside > 0.2) verdict = 'undervalued';
+      else if (upside < -0.2) verdict = 'overvalued';
+      else verdict = 'fairly valued';
+    }
+
+    if (base.terminalShare > 0.8) {
+      warnings.push(
+        `${Math.round(base.terminalShare * 100)}% of the valuation sits in the terminal value — the result is driven by assumptions beyond year ${years}, not by the forecast.`
+      );
+    }
+
+    const implied =
+      price !== null ? impliedGrowth(price, baseFcf, terminalGrowth, years, wacc, netDebt, shares) : null;
+
+    res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate=86400');
+    return res.status(200).json({
+      ticker: ticker.toUpperCase(),
+      company: match.name,
+      cik: match.cik,
+      quote,
+      assumptions: {
+        wacc,
+        terminalGrowth,
+        initialGrowth,
+        years,
+        basis: basisUsed,
+        baseFreeCashFlow: baseFcf,
+        baseFreeCashFlowThrough: basisUsed === 'ttm' ? ttm?.through : latestFy.periodEnd,
+      },
+      inputs: {
+        shares,
+        dilutedShares: diluted?.val ?? null,
+        coverPageShares: cover?.val ?? null,
+        cash: cash?.val ?? 0,
+        shortTermInvestments: sti?.val ?? 0,
+        totalDebt,
+        netDebt,
+        asOf: cash?.end ?? null,
+      },
+      history,
+      alternativeBases: {
+        ttm: ttm?.freeCashFlow ?? null,
+        lastFy: latestFy.freeCashFlow,
+        avg3,
+      },
+      valuation: {
+        perShare: +base.perShare.toFixed(2),
+        enterpriseValue: base.enterpriseValue,
+        equityValue: base.equityValue,
+        pvExplicit: base.pvExplicit,
+        pvTerminal: base.pvTerminal,
+        terminalShare: +base.terminalShare.toFixed(4),
+        projection: base.rows.map((r) => ({
+          year: r.year,
+          growth: +r.growth.toFixed(4),
+          freeCashFlow: Math.round(r.fcf),
+          presentValue: Math.round(r.pv),
+        })),
+      },
+      verdict: { rating: verdict, upside: upside === null ? null : +upside.toFixed(4) },
+      reverseDcf: {
+        impliedInitialGrowth: implied === null ? null : +implied.toFixed(4),
+        note:
+          implied === null
+            ? 'Current price is outside the range solvable with these assumptions.'
+            : `At a ${(wacc * 100).toFixed(1)}% discount rate, today's price implies free cash flow growing ${(implied * 100).toFixed(1)}% initially, fading to ${(terminalGrowth * 100).toFixed(1)}% over ${years} years.`,
+      },
+      sensitivity: { waccAxis, terminalGrowthAxis: tgAxis, grid },
+      sources,
+      warnings,
+      disclaimer: 'Model output from public filings. Not investment advice.',
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'DCF failed', detail: err.message });
+  }
+}
