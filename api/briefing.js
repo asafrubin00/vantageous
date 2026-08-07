@@ -1,6 +1,6 @@
 import Parser from 'rss-parser';
 
-const FEEDS = {
+const FT_FEEDS = {
   home: 'https://www.ft.com/rss/home',
   markets: 'https://www.ft.com/markets?format=rss',
   uk: 'https://www.ft.com/uk?format=rss',
@@ -8,6 +8,20 @@ const FEEDS = {
   opinion: 'https://www.ft.com/opinion?format=rss',
   tech: 'https://www.ft.com/technology?format=rss',
 };
+
+const EXTRA_FEEDS = [
+  'http://feeds.bbci.co.uk/news/business/rss.xml',
+  'http://feeds.bbci.co.uk/news/world/rss.xml',
+  'https://www.theguardian.com/uk/business/rss',
+  'https://www.theguardian.com/world/rss',
+  'https://www.cnbc.com/id/100003114/device/rss/rss.html',
+  'https://finance.yahoo.com/news/rssindex',
+  'https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines',
+  'https://feeds.reuters.com/reuters/businessNews',
+  'https://feeds.reuters.com/reuters/worldNews',
+  'https://www.economist.com/finance-and-economics/rss.xml',
+  'https://feeds.apnews.com/apnews/business',
+];
 
 function mapItem(item) {
   return {
@@ -25,9 +39,8 @@ export default async function handler(req, res) {
   if (mode === 'all') {
     try {
       const parser = new Parser();
-      const results = await Promise.allSettled(
-        Object.values(FEEDS).map((url) => parser.parseURL(url))
-      );
+      const allUrls = [...Object.values(FT_FEEDS), ...EXTRA_FEEDS];
+      const results = await Promise.allSettled(allUrls.map((url) => parser.parseURL(url)));
       const seen = new Set();
       const items = [];
       for (const result of results) {
@@ -47,7 +60,7 @@ export default async function handler(req, res) {
     }
   }
 
-  const feedUrl = FEEDS[section];
+  const feedUrl = FT_FEEDS[section];
   if (!feedUrl) {
     return res.status(400).json({ error: `Unknown section: ${section}` });
   }
@@ -56,7 +69,6 @@ export default async function handler(req, res) {
     const parser = new Parser();
     const feed = await parser.parseURL(feedUrl);
     const items = feed.items.slice(0, 12).map(mapItem);
-
     res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
     return res.status(200).json(items);
   } catch (err) {
