@@ -1,12 +1,12 @@
 # Vantageous
 
-An AI-powered market intelligence dashboard that pulls from 11+ reputable news sources, identifies investment signals in real-time, and presents them as structured, filterable trade ideas.
+An AI-powered market intelligence dashboard that pulls from 9 reputable news sources, identifies investment signals in real-time, and presents them as structured, filterable trade ideas.
 
 Live at [vantageous.vercel.app](https://vantageous.vercel.app)
 
 ## What it does
 
-- Fetches the latest headlines from Financial Times, Reuters, BBC, Guardian, CNBC, AP, The Economist, Yahoo Finance, MarketWatch, Seeking Alpha, and Investopedia simultaneously.
+- Fetches the latest headlines from Financial Times, BBC, Guardian, CNBC, The Economist, Yahoo Finance, MarketWatch, Seeking Alpha, and NPR simultaneously — 25 feeds in total, in parallel, in well under a second.
 - Sends the top stories to Claude for structured signal extraction — identifying which instruments (equities, ETFs, commodities, FX, bonds, crypto, indices) are likely to move and in which direction, with a thesis and caveats for each.
 - Displays signals as filterable cards, organised by confidence, category, industry, region, and asset type.
 - Surfaces analyst consensus ratings (Strong Buy through Strong Sell) per equity ticker, pulled from Finnhub and cached to avoid redundant lookups.
@@ -116,10 +116,14 @@ The app will be available at `http://localhost:3000`.
 
 ## Caching
 
-Signal analysis is cached for 30 minutes at the CDN layer (`s-maxage=1800`) to avoid redundant Claude API calls. Analyst ratings are cached for 24 hours. The Briefing feed refreshes every 20 minutes client-side.
+Signal analysis is cached for 30 minutes at the CDN layer (`s-maxage=1800`) to avoid redundant Claude API calls, with a 24-hour `stale-while-revalidate` window. Fetching the feeds takes under a second; generating the analysis takes around a minute and accounts for essentially all of the response time. The revalidation window means a visitor is served the previous batch immediately while a fresh one builds in the background, so only a genuinely cold cache waits for the full call. Analyst ratings are cached for 24 hours. The Briefing feed refreshes every 20 minutes client-side.
 DCF results are cached for an hour per ticker-and-assumption combination, and the valuation view
 debounces assumption changes so dragging a slider fires one request rather than thirty.
 
 ## Notes on sources
 
-Bloomberg does not publish a public RSS feed and is not included. All signals are AI-generated and should not be relied upon for investment decisions.
+Bloomberg does not publish a public RSS feed and is not included. Reuters, AP and Investopedia were previously listed here but have all withdrawn their public RSS feeds — their URLs no longer resolve, and every documented replacement returns 401, 404 or 406. They have been removed rather than left in place failing silently.
+
+The signals endpoint reports per-publisher health with each response, and the Sources panel shows a red marker against any publisher whose feeds did not respond, so a feed going dark is visible rather than silently shrinking the input.
+
+All signals are AI-generated and should not be relied upon for investment decisions.

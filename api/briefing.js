@@ -17,10 +17,11 @@ const EXTRA_FEEDS = [
   'https://www.cnbc.com/id/100003114/device/rss/rss.html',
   'https://finance.yahoo.com/news/rssindex',
   'https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines',
-  'https://feeds.reuters.com/reuters/businessNews',
-  'https://feeds.reuters.com/reuters/worldNews',
   'https://www.economist.com/finance-and-economics/rss.xml',
-  'https://feeds.apnews.com/apnews/business',
+  // Reuters and AP dropped their public RSS feeds; the URLs that were here no
+  // longer resolve. NPR and the Guardian economics feed replace the coverage.
+  'https://feeds.npr.org/1006/rss.xml',
+  'https://www.theguardian.com/business/economics/rss',
 ];
 
 function mapItem(item) {

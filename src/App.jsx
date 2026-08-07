@@ -6,10 +6,13 @@ const SECTIONS = ['Home', 'Markets', 'UK', 'World', 'Opinion', 'Tech'];
 const REFRESH_INTERVAL = 20 * 60 * 1000;
 const STORAGE_KEY = 'vantageous-custom-filters';
 
+// Reuters, AP and Investopedia were listed here long after their public RSS feeds
+// stopped resolving, so the app advertised sources it was reading nothing from.
+// The signals endpoint now reports which publishers actually responded, and this
+// list is only the fallback shown before that arrives.
 const SOURCES = [
-  'Financial Times', 'BBC News', 'The Guardian', 'Reuters', 'CNBC',
-  'AP News', 'The Economist', 'Yahoo Finance', 'MarketWatch',
-  'Seeking Alpha', 'Investopedia',
+  'Financial Times', 'BBC News', 'The Guardian', 'CNBC', 'The Economist',
+  'Yahoo Finance', 'MarketWatch', 'Seeking Alpha', 'NPR',
 ];
 
 const SIGNAL_CATEGORIES = [
@@ -507,7 +510,13 @@ function TrendingModal({ signals, onClose }) {
 
 // ── Sources modal ─────────────────────────────────────────────────────────────
 
-function SourcesModal({ onClose }) {
+function SourcesModal({ onClose, sources }) {
+  // Prefer live health from the last signals fetch; fall back to the static list
+  // before the first response lands.
+  const rows = sources?.length
+    ? sources.map((s) => ({ name: s.name, ok: s.ok, note: s.failed ? `${s.failed} of ${s.feeds} feeds down` : null }))
+    : SOURCES.map((name) => ({ name, ok: true, note: null }));
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={onClose}>
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
@@ -517,10 +526,11 @@ function SourcesModal({ onClose }) {
           <button onClick={onClose} className="text-gray-500 hover:text-gray-300 text-lg leading-none">✕</button>
         </div>
         <ul className="space-y-2.5 mb-4">
-          {SOURCES.map((s) => (
-            <li key={s} className="flex items-center gap-2.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500/70 shrink-0" />
-              <span className="text-gray-300 text-sm">{s}</span>
+          {rows.map((s) => (
+            <li key={s.name} className="flex items-center gap-2.5">
+              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${s.ok ? 'bg-emerald-500/70' : 'bg-red-500/70'}`} />
+              <span className={`text-sm ${s.ok ? 'text-gray-300' : 'text-gray-500'}`}>{s.name}</span>
+              {s.note && <span className="text-[10px] text-gray-600 ml-auto">{s.note}</span>}
             </li>
           ))}
           <li className="flex items-center gap-2.5 opacity-40">
@@ -551,7 +561,7 @@ function SignalsView({ filters, setFilters, onDataLoaded }) {
       if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
       const json = await res.json();
       setData(json);
-      onDataLoaded(json.signals || []);
+      onDataLoaded(json.signals || [], json.sources || []);
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
   }, [onDataLoaded]);
@@ -608,7 +618,7 @@ function SignalsView({ filters, setFilters, onDataLoaded }) {
 
       {loading ? (
         <div className="space-y-3">
-          <p className="text-gray-500 text-xs animate-pulse mb-4">Pulling from {SOURCES.length}+ sources and analysing with AI… ~15 seconds</p>
+          <p className="text-gray-500 text-xs animate-pulse mb-4">Reading {SOURCES.length} sources and analysing with AI… this can take up to a minute</p>
           {Array.from({ length: 5 }).map((_, i) => (
             <div key={i} className="bg-dark-card border border-dark-border rounded-lg p-4 animate-pulse">
               <div className="h-3 bg-dark-border rounded w-20 mb-3" />
@@ -1275,6 +1285,7 @@ export default function App() {
   const [showTrending, setShowTrending] = useState(false);
   const [showSources, setShowSources] = useState(false);
   const [signalsList, setSignalsList] = useState([]);
+  const [sourceHealth, setSourceHealth] = useState([]);
   const [valuationTicker, setValuationTicker] = useState(null);
 
   const openValuation = useCallback((ticker) => {
@@ -1285,7 +1296,10 @@ export default function App() {
   const setFilter = (key, value) => setFilters((f) => ({ ...f, [key]: value }));
   const activeCount = Object.entries(filters).filter(([k, v]) => k !== 'search' && v !== 'all').length + (filters.search ? 1 : 0);
 
-  const handleDataLoaded = useCallback((signals) => setSignalsList(signals), []);
+  const handleDataLoaded = useCallback((signals, sources) => {
+    setSignalsList(signals);
+    setSourceHealth(sources);
+  }, []);
 
   return (
     <RatingsProvider>
@@ -1340,11 +1354,11 @@ export default function App() {
         </main>
 
         <footer className="border-t border-dark-border mt-12 py-5 text-center text-gray-700 text-[11px]">
-          FT · BBC · Reuters · Guardian · CNBC · AP · Economist & more · Analysis by Claude · Not financial advice
+          FT · BBC · Guardian · CNBC · Economist · Yahoo · MarketWatch & more · Analysis by Claude · Not financial advice
         </footer>
 
         {showTrending && <TrendingModal signals={signalsList} onClose={() => setShowTrending(false)} />}
-        {showSources && <SourcesModal onClose={() => setShowSources(false)} />}
+        {showSources && <SourcesModal onClose={() => setShowSources(false)} sources={sourceHealth} />}
       </div>
       </ValuationCtx.Provider>
     </RatingsProvider>
