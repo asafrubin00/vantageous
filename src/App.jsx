@@ -119,6 +119,14 @@ function matchesKeywords(article, keywords) {
 
 const RatingsCtx = createContext({ ratings: new Map(), update: () => {} });
 
+// Lets a ticker anywhere in the signal feed jump straight into the valuation view
+// without threading a callback through every card and row between here and there.
+const ValuationCtx = createContext(null);
+
+// Only individual operating companies have the SEC filings a DCF needs. ETFs,
+// commodities, currencies and indices have no cash flow statement to model.
+const dcfEligible = (type, ticker) => !!ticker && type === 'stock';
+
 function RatingsProvider({ children }) {
   const [ratings, setRatings] = useState(() => new Map());
   const update = useCallback((ticker, rating) => {
@@ -327,15 +335,30 @@ function FilterBar({ filters, onChange, onClear, activeCount, onTrending, onSour
 
 function InstrumentRow({ sig }) {
   const rating = useRating(sig.ticker, sig.type);
+  const openValuation = useContext(ValuationCtx);
+  const valuable = dcfEligible(sig.type, sig.ticker) && openValuation;
+
   return (
     <div className="border border-dark-border/50 rounded p-3 bg-dark/30">
       <div className="flex items-center gap-1.5 flex-wrap mb-1.5">
         <DirectionBadge direction={sig.direction} />
         <span className="text-gray-100 text-sm font-medium">{sig.name}</span>
         {sig.ticker && (
-          <span className="text-salmon-dim text-[11px] font-mono bg-dark-border/40 px-1.5 py-0.5 rounded">
-            {sig.ticker}
-          </span>
+          // The faint border is the only cue that separates a valuable ticker from
+          // an inert one — hover alone would leave this invisible on touch devices.
+          valuable ? (
+            <button
+              onClick={() => openValuation(sig.ticker)}
+              title={`Value ${sig.ticker} with a DCF`}
+              className="text-salmon-dim hover:text-salmon text-[11px] font-mono bg-salmon/10 hover:bg-salmon/25 border border-salmon/25 hover:border-salmon/50 px-1.5 py-0.5 rounded transition-colors cursor-pointer"
+            >
+              {sig.ticker}
+            </button>
+          ) : (
+            <span className="text-salmon-dim text-[11px] font-mono bg-dark-border/40 border border-transparent px-1.5 py-0.5 rounded">
+              {sig.ticker}
+            </span>
+          )
         )}
         {rating && <RatingBadge rating={rating} />}
         <span className="ml-auto shrink-0"><ConfidencePip confidence={sig.confidence} /></span>
@@ -424,12 +447,13 @@ function SummaryBar({ signals, total }) {
 // ── Trending modal ────────────────────────────────────────────────────────────
 
 function TrendingModal({ signals, onClose }) {
+  const openValuation = useContext(ValuationCtx);
   const tickers = useMemo(() => {
     const counts = {};
     for (const item of signals) {
       for (const sig of item.signals) {
         if (!sig.ticker) continue;
-        if (!counts[sig.ticker]) counts[sig.ticker] = { ticker: sig.ticker, name: sig.name, count: 0, net: 0 };
+        if (!counts[sig.ticker]) counts[sig.ticker] = { ticker: sig.ticker, name: sig.name, type: sig.type, count: 0, net: 0 };
         counts[sig.ticker].count++;
         counts[sig.ticker].net += sig.direction === 'up' ? 1 : -1;
       }
@@ -451,10 +475,21 @@ function TrendingModal({ signals, onClose }) {
           <ul className="space-y-2.5">
             {tickers.map((t) => (
               <li key={t.ticker} className="flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <span className="text-sm font-mono text-salmon-dim font-medium">{t.ticker}</span>
-                  <span className="text-gray-500 text-xs ml-2 truncate">{t.name}</span>
-                </div>
+                {dcfEligible(t.type, t.ticker) && openValuation ? (
+                  <button
+                    onClick={() => { openValuation(t.ticker); onClose(); }}
+                    title={`Value ${t.ticker} with a DCF`}
+                    className="min-w-0 text-left group"
+                  >
+                    <span className="text-sm font-mono text-salmon-dim group-hover:text-salmon font-medium transition-colors">{t.ticker}</span>
+                    <span className="text-gray-500 group-hover:text-gray-400 text-xs ml-2 truncate transition-colors">{t.name}</span>
+                  </button>
+                ) : (
+                  <div className="min-w-0">
+                    <span className="text-sm font-mono text-salmon-dim font-medium">{t.ticker}</span>
+                    <span className="text-gray-500 text-xs ml-2 truncate">{t.name}</span>
+                  </div>
+                )}
                 <div className="flex items-center gap-2 shrink-0">
                   <span className={`text-xs font-semibold ${t.net > 0 ? 'text-emerald-400' : t.net < 0 ? 'text-red-400' : 'text-gray-500'}`}>
                     {t.net > 0 ? '▲' : t.net < 0 ? '▼' : '·'}
@@ -1036,10 +1071,14 @@ function Provenance({ data }) {
   );
 }
 
-function ValuationView() {
-  const [query, setQuery] = useState('');
-  const [ticker, setTicker] = useState(null);
+// The active ticker lives in App so the signals feed can set it. This view stays
+// mounted across tab switches, so assumptions and results survive a trip to
+// Signals and back rather than resetting and refetching.
+function ValuationView({ ticker, onTicker }) {
+  const [query, setQuery] = useState(ticker ?? '');
   const [assumptions, setAssumptions] = useState(DCF_DEFAULTS);
+
+  useEffect(() => { if (ticker) setQuery(ticker); }, [ticker]);
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -1073,7 +1112,7 @@ function ValuationView() {
   const submit = (e) => {
     e.preventDefault();
     const t = query.trim().toUpperCase();
-    if (t) setTicker(t);
+    if (t) onTicker(t);
   };
 
   return (
@@ -1236,6 +1275,12 @@ export default function App() {
   const [showTrending, setShowTrending] = useState(false);
   const [showSources, setShowSources] = useState(false);
   const [signalsList, setSignalsList] = useState([]);
+  const [valuationTicker, setValuationTicker] = useState(null);
+
+  const openValuation = useCallback((ticker) => {
+    setValuationTicker(ticker.toUpperCase());
+    setMode('valuation');
+  }, []);
 
   const setFilter = (key, value) => setFilters((f) => ({ ...f, [key]: value }));
   const activeCount = Object.entries(filters).filter(([k, v]) => k !== 'search' && v !== 'all').length + (filters.search ? 1 : 0);
@@ -1244,6 +1289,7 @@ export default function App() {
 
   return (
     <RatingsProvider>
+      <ValuationCtx.Provider value={openValuation}>
       <div className="min-h-screen bg-dark font-body">
         <header className="border-b border-dark-border sticky top-0 z-10 bg-dark/95 backdrop-blur-sm">
           <div className="max-w-6xl mx-auto px-3 sm:px-4 pt-4 pb-3">
@@ -1286,7 +1332,11 @@ export default function App() {
             <SignalsView filters={filters} setFilters={setFilters} onDataLoaded={handleDataLoaded} />
           )}
           {mode === 'briefing' && <BriefingView />}
-          {mode === 'valuation' && <ValuationView />}
+          {/* Kept mounted rather than conditionally rendered so a ticker you were
+              looking at is still there when you come back from the signal feed. */}
+          <div className={mode === 'valuation' ? '' : 'hidden'}>
+            <ValuationView ticker={valuationTicker} onTicker={setValuationTicker} />
+          </div>
         </main>
 
         <footer className="border-t border-dark-border mt-12 py-5 text-center text-gray-700 text-[11px]">
@@ -1296,6 +1346,7 @@ export default function App() {
         {showTrending && <TrendingModal signals={signalsList} onClose={() => setShowTrending(false)} />}
         {showSources && <SourcesModal onClose={() => setShowSources(false)} />}
       </div>
+      </ValuationCtx.Provider>
     </RatingsProvider>
   );
 }

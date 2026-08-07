@@ -259,7 +259,13 @@ export default async function handler(req, res) {
     const ocfAnnual = annualSeries(ocfRef.entries);
     const capexAnnual = annualSeries(capexRef.entries);
     if (!ocfAnnual.length || !capexAnnual.length) {
-      return res.status(422).json({ error: 'No annual (10-K) cash flow history found for this filer.' });
+      return res.status(422).json({
+        error: `No annual (10-K) cash flow history found for ${match.name}.`,
+        detail:
+          'The ticker resolved to a SEC registrant with little or no filing history — often a recently reorganised entity whose historic filings sit under a different CIK.',
+        ticker: ticker.toUpperCase(),
+        company: match.name,
+      });
     }
 
     // Pair the two series by fiscal period end so a missing year can't misalign them.
