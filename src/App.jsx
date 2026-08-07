@@ -101,6 +101,37 @@ function loadCustomFilters() {
 }
 function saveCustomFilters(f) { localStorage.setItem(STORAGE_KEY, JSON.stringify(f)); }
 
+const WATCHLIST_KEY = 'vantageous.watchlist';
+const ASSUMPTIONS_KEY = 'vantageous.assumptions';
+
+function loadWatchlist() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(WATCHLIST_KEY) || '[]');
+    return Array.isArray(raw) ? raw.filter((t) => typeof t === 'string') : [];
+  } catch { return []; }
+}
+function saveWatchlist(list) {
+  try { localStorage.setItem(WATCHLIST_KEY, JSON.stringify(list)); } catch { /* private mode */ }
+}
+
+// Assumptions persist alongside the watchlist. They are the user's own view of
+// risk and growth, and a saved list re-rated against defaults every session would
+// not be theirs. Unknown keys are dropped so an old stored shape cannot inject
+// junk into the query string.
+function loadAssumptions(defaults) {
+  try {
+    const saved = JSON.parse(localStorage.getItem(ASSUMPTIONS_KEY) || '{}');
+    const merged = { ...defaults };
+    for (const key of Object.keys(defaults)) {
+      if (typeof saved[key] === typeof defaults[key]) merged[key] = saved[key];
+    }
+    return merged;
+  } catch { return { ...defaults }; }
+}
+function saveAssumptions(a) {
+  try { localStorage.setItem(ASSUMPTIONS_KEY, JSON.stringify(a)); } catch { /* private mode */ }
+}
+
 function timeAgo(dateStr) {
   const s = Math.floor((Date.now() - new Date(dateStr)) / 1000);
   if (s < 60) return 'just now';
@@ -1081,14 +1112,159 @@ function Provenance({ data }) {
   );
 }
 
+// Values every watched ticker against whatever assumptions are currently set, so
+// changing the discount rate re-rates the whole list rather than just the open one.
+// Requests go one per ticker rather than through a batch endpoint: each ticker then
+// caches independently at the CDN, so a list that overlaps yesterday's is mostly hits.
+function useWatchlistValuations(tickers, assumptions) {
+  const [rows, setRows] = useState({});
+  const key = tickers.join(',');
+  const assumptionKey = JSON.stringify(assumptions);
+
+  useEffect(() => {
+    if (!tickers.length) { setRows({}); return; }
+    let cancelled = false;
+
+    const timer = setTimeout(async () => {
+      setRows(Object.fromEntries(tickers.map((t) => [t, { state: 'loading' }])));
+      const queue = [...tickers];
+
+      // Four at a time — enough to feel instant, few enough not to stampede the
+      // function on a long list.
+      const worker = async () => {
+        while (queue.length && !cancelled) {
+          const ticker = queue.shift();
+          try {
+            const res = await fetch(`/api/dcf?${new URLSearchParams({ ticker, ...assumptions })}`);
+            const json = await res.json();
+            if (cancelled) return;
+            setRows((prev) => ({ ...prev, [ticker]: res.ok ? { state: 'ok', data: json } : { state: 'error', error: json } }));
+          } catch (err) {
+            if (!cancelled) setRows((prev) => ({ ...prev, [ticker]: { state: 'error', error: { error: 'Could not reach the valuation service' } } }));
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: Math.min(4, tickers.length) }, worker));
+    }, 400);
+
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [key, assumptionKey]);
+
+  return rows;
+}
+
+function WatchlistPanel({ tickers, assumptions, onSelect, onRemove, heading = 'Watchlist' }) {
+  const rows = useWatchlistValuations(tickers, assumptions);
+
+  // Cheapest first, so the list answers "what looks interesting today" at a glance.
+  // Anything without a verdict sorts to the bottom rather than pretending to rank.
+  const ordered = [...tickers].sort((a, b) => {
+    const up = (t) => rows[t]?.state === 'ok' ? rows[t].data.verdict.upside ?? -Infinity : -Infinity;
+    return up(b) - up(a);
+  });
+
+  const done = tickers.filter((t) => rows[t] && rows[t].state !== 'loading').length;
+
+  return (
+    <div className="bg-dark-card border border-dark-border rounded-lg p-4">
+      <div className="flex items-baseline justify-between gap-3 mb-3">
+        <h3 className="text-sm text-gray-200">{heading}</h3>
+        <span className="text-[10px] text-gray-600">
+          {done < tickers.length ? `valuing ${done}/${tickers.length}…` : `${tickers.length} ticker${tickers.length === 1 ? '' : 's'} · your current assumptions`}
+        </span>
+      </div>
+
+      <div className="overflow-x-auto scrollbar-none -mx-1 px-1">
+        <table className="w-full min-w-[420px] text-[11px] border-collapse">
+          <thead>
+            <tr className="text-gray-600">
+              <th className="text-left font-normal p-1.5">Ticker</th>
+              <th className="text-left font-normal p-1.5">Company</th>
+              <th className="text-right font-normal p-1.5">Price</th>
+              <th className="text-right font-normal p-1.5">Fair value</th>
+              <th className="text-right font-normal p-1.5">Upside</th>
+              <th className="w-6" />
+            </tr>
+          </thead>
+          <tbody>
+            {ordered.map((ticker) => {
+              const row = rows[ticker];
+              const ok = row?.state === 'ok';
+              const upside = ok ? row.data.verdict.upside : null;
+              const tone = upside === null ? 'text-gray-600' : upside > 0 ? 'text-emerald-400' : 'text-red-400';
+
+              return (
+                <tr key={ticker} className="border-t border-dark-border/40 hover:bg-dark/40 transition-colors">
+                  <td className="p-1.5">
+                    <button
+                      onClick={() => onSelect(ticker)}
+                      className="font-mono text-salmon-dim hover:text-salmon transition-colors"
+                    >
+                      {ticker}
+                    </button>
+                  </td>
+                  <td className="p-1.5 text-gray-400 max-w-[180px] truncate">
+                    {row?.state === 'loading' ? <span className="text-gray-700">…</span>
+                      : ok ? row.data.company
+                        : <span className="text-gray-600">{row?.error?.company ?? '—'}</span>}
+                  </td>
+                  <td className="p-1.5 text-right font-mono text-gray-400">
+                    {ok && row.data.quote ? `$${row.data.quote.price.toFixed(2)}` : '—'}
+                  </td>
+                  <td className="p-1.5 text-right font-mono text-gray-200">
+                    {ok ? `$${row.data.valuation.perShare.toFixed(2)}` : '—'}
+                  </td>
+                  <td className={`p-1.5 text-right font-mono ${tone}`}>
+                    {row?.state === 'loading' ? '' : upside === null ? 'n/a' : fmtPct(upside)}
+                  </td>
+                  <td className="p-1.5 text-right">
+                    <button
+                      onClick={() => onRemove(ticker)}
+                      title={`Remove ${ticker} from watchlist`}
+                      className="text-gray-700 hover:text-red-400 transition-colors leading-none"
+                    >
+                      ✕
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* A DCF legitimately does not apply to some filers. Saying so beside the row
+          is more useful than leaving a dash the reader has to interpret. */}
+      {ordered.some((t) => rows[t]?.state === 'error') && (
+        <div className="mt-3 pt-3 border-t border-dark-border/40 space-y-1">
+          {ordered.filter((t) => rows[t]?.state === 'error').map((t) => (
+            <p key={t} className="text-[10px] text-gray-600 leading-relaxed">
+              <span className="font-mono text-gray-500">{t}</span> — {rows[t].error.error}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // The active ticker lives in App so the signals feed can set it. This view stays
 // mounted across tab switches, so assumptions and results survive a trip to
 // Signals and back rather than resetting and refetching.
 function ValuationView({ ticker, onTicker }) {
   const [query, setQuery] = useState(ticker ?? '');
-  const [assumptions, setAssumptions] = useState(DCF_DEFAULTS);
+  const [assumptions, setAssumptions] = useState(() => loadAssumptions(DCF_DEFAULTS));
+  const [watchlist, setWatchlist] = useState(loadWatchlist);
 
   useEffect(() => { if (ticker) setQuery(ticker); }, [ticker]);
+  useEffect(() => { saveWatchlist(watchlist); }, [watchlist]);
+  useEffect(() => { saveAssumptions(assumptions); }, [assumptions]);
+
+  const watched = ticker ? watchlist.includes(ticker) : false;
+  const toggleWatch = (t) =>
+    setWatchlist((list) => (list.includes(t) ? list.filter((x) => x !== t) : [...list, t]));
+  const removeWatch = (t) => setWatchlist((list) => list.filter((x) => x !== t));
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -1143,7 +1319,9 @@ function ValuationView({ ticker, onTicker }) {
         </button>
       </form>
 
-      {!ticker && (
+      {/* The explainer only earns the space while there is nothing to show. With a
+          watchlist saved, that becomes the landing surface instead. */}
+      {!ticker && watchlist.length === 0 && (
         <div className="text-center py-16 px-4">
           <p className="font-headline text-xl text-gray-300 mb-2">Discounted cash flow</p>
           <p className="text-gray-600 text-sm max-w-md mx-auto leading-relaxed">
@@ -1151,10 +1329,14 @@ function ValuationView({ ticker, onTicker }) {
             assumptions. Covers US SEC filers only — and free-cash-flow DCF does not apply to
             banks or insurers.
           </p>
+          <p className="text-gray-700 text-xs mt-3">Star a ticker to keep it on a watchlist here.</p>
         </div>
       )}
 
-      {ticker && (
+      {/* The controls render whenever there is anything to re-rate, not just when a
+          ticker is open — a watchlist labelled "your current assumptions" with no
+          way to reach those assumptions would be a dead end. */}
+      {(ticker || watchlist.length > 0) && (
         <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
           {/* On narrow screens the verdict comes first — scrolling past five sliders
               to reach the answer is the wrong order on a phone. */}
@@ -1237,6 +1419,14 @@ function ValuationView({ ticker, onTicker }) {
                   {data.quote?.exchange && (
                     <span className="text-[10px] text-gray-600 uppercase tracking-wide">{data.quote.exchange}</span>
                   )}
+                  <button
+                    onClick={() => toggleWatch(data.ticker)}
+                    title={watched ? `Remove ${data.ticker} from watchlist` : `Add ${data.ticker} to watchlist`}
+                    aria-pressed={watched}
+                    className={`text-sm leading-none transition-colors ${watched ? 'text-salmon' : 'text-gray-600 hover:text-salmon-dim'}`}
+                  >
+                    {watched ? '★' : '☆'}
+                  </button>
                   {loading && <span className="text-[10px] text-gray-600 ml-auto">recalculating…</span>}
                 </div>
 
@@ -1271,6 +1461,17 @@ function ValuationView({ ticker, onTicker }) {
                   </p>
                 </div>
               </div>
+            )}
+
+            {/* Sits below the open valuation, or stands alone when nothing is open. */}
+            {watchlist.length > 0 && (
+              <WatchlistPanel
+                tickers={watchlist}
+                assumptions={assumptions}
+                onSelect={onTicker}
+                onRemove={removeWatch}
+                heading={ticker ? 'Watchlist · same assumptions' : 'Watchlist'}
+              />
             )}
           </div>
         </div>

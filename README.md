@@ -62,6 +62,20 @@ The endpoint declines rather than guessing when a DCF would be invalid:
 
 Coverage is US SEC filers only.
 
+### Watchlist
+
+Starring a ticker keeps it on a watchlist, which becomes the landing surface of the
+valuation view. Every entry is valued against whatever assumptions are currently set,
+so moving the discount rate re-rates the whole list at once rather than one name at a
+time, and the list sorts cheapest-first on upside.
+
+The watchlist and the assumptions both persist in `localStorage` — assumptions are your
+own view of risk and growth, and a saved list re-rated against defaults each session
+would not be yours. Each ticker is requested separately rather than through a batch
+endpoint, so entries cache independently at the CDN and a list that overlaps yesterday's
+is mostly cache hits. Tickers the model cannot value are not offered a star, rather than
+being saved as a permanent blank row.
+
 ## Stack
 
 - Front end: React + Vite + Tailwind CSS
