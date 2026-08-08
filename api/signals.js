@@ -43,7 +43,7 @@ const FEEDS = [
 
 const SYSTEM_PROMPT = `You are a senior financial analyst. Given a list of news headlines and snippets, identify market signals — stocks, ETFs, commodities, bonds, or currencies likely to move based on the news.
 
-Return a JSON array. Each element corresponds to one news story with clear market implications. Skip opinion pieces or generic stories with no actionable angle. Include 1–4 instruments per story. Aim for 8–12 total story entries.
+Return a JSON array. Each element corresponds to one news story with clear market implications. Skip opinion pieces or generic stories with no actionable angle. Include 1–4 instruments per story.
 
 Shape of each element:
 {
@@ -67,6 +67,54 @@ Shape of each element:
 region should be a short string like "US", "Europe", "UK", "China", "Middle East", "Global", "Asia", "EM" etc.
 
 Return only valid JSON — no markdown, no explanation outside the array.`;
+
+// Reading the feeds takes well under a second; the analysis took around a minute and
+// was the whole of the response time. Splitting the stories across concurrent calls
+// cuts wall-clock time to roughly the slowest one, for the same total work and the
+// same number of stories analysed. It also means one failed call costs a few stories
+// rather than the entire response.
+const ANALYSIS_BATCHES = 3;
+const STORIES_ANALYSED = 27;
+
+function parseSignalArray(rawText) {
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    const match = rawText.match(/\[[\s\S]*\]/);
+    if (!match) throw new Error('Could not parse Claude response as JSON');
+    return JSON.parse(match[0]);
+  }
+}
+
+async function analyseBatch(stories, target) {
+  const newsText = stories
+    .map((item, i) => `${i + 1}. ${item.title}\n${item.description}\nURL: ${item.link}`)
+    .join('\n\n');
+
+  const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 2500,
+      system: SYSTEM_PROMPT,
+      messages: [
+        {
+          role: 'user',
+          content: `Here are some of today's top news stories:\n\n${newsText}\n\nIdentify market signals. Return ${target} story entries — the ones with the clearest market implications.`,
+        },
+      ],
+    }),
+  });
+
+  if (!claudeRes.ok) throw new Error(`Claude API error ${claudeRes.status}: ${(await claudeRes.text()).slice(0, 200)}`);
+  const data = await claudeRes.json();
+  return parseSignalArray(data.content[0].text.trim());
+}
 
 export default async function handler(req, res) {
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -111,59 +159,60 @@ export default async function handler(req, res) {
     }
 
     items.sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
-    const top = items.slice(0, 25);
+    const top = items.slice(0, STORIES_ANALYSED);
 
-    const newsText = top
-      .map((item, i) => `${i + 1}. ${item.title}\n${item.description}\nURL: ${item.link}`)
-      .join('\n\n');
+    // Deal the stories round-robin rather than in contiguous slices, so each batch
+    // sees the same spread of freshness instead of one getting only the oldest.
+    const batches = Array.from({ length: ANALYSIS_BATCHES }, (_, b) => top.filter((_, i) => i % ANALYSIS_BATCHES === b))
+      .filter((batch) => batch.length);
 
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 6000,
-        system: SYSTEM_PROMPT,
-        messages: [
-          {
-            role: 'user',
-            content: `Here are today's top news stories:\n\n${newsText}\n\nIdentify market signals.`,
-          },
-        ],
-      }),
-    });
+    const perBatch = Math.max(Math.round(10 / batches.length), 2);
+    const analysed = await Promise.allSettled(batches.map((batch) => analyseBatch(batch, perBatch)));
 
-    if (!claudeRes.ok) {
-      const err = await claudeRes.text();
-      return res.status(500).json({ error: 'Claude API error', detail: err });
+    const failedBatches = analysed.filter((r) => r.status === 'rejected');
+    for (const f of failedBatches) console.warn(`[signals] analysis batch failed: ${f.reason?.message}`);
+
+    if (failedBatches.length === analysed.length) {
+      return res.status(500).json({
+        error: 'Claude API error',
+        detail: analysed[0]?.reason?.message ?? 'all analysis batches failed',
+      });
     }
 
-    const claudeData = await claudeRes.json();
-    const rawText = claudeData.content[0].text.trim();
-
-    let signals;
-    try {
-      signals = JSON.parse(rawText);
-    } catch {
-      const match = rawText.match(/\[[\s\S]*\]/);
-      if (!match) throw new Error('Could not parse Claude response as JSON');
-      signals = JSON.parse(match[0]);
+    // Batches see different stories, but a wire story syndicated to two outlets can
+    // still surface twice, so merge on the story link.
+    const bySignalStory = new Set();
+    const signals = [];
+    for (const result of analysed) {
+      if (result.status !== 'fulfilled' || !Array.isArray(result.value)) continue;
+      for (const entry of result.value) {
+        const key = entry?.story?.link || entry?.story?.title;
+        if (!key || bySignalStory.has(key)) continue;
+        bySignalStory.add(key);
+        signals.push(entry);
+      }
     }
 
-    // Fetching the feeds takes well under a second; generating the analysis takes
-    // around a minute, and that is the whole of the response time. Rather than
-    // making a visitor wait for it, the CDN serves the last batch immediately and
-    // rebuilds in the background. The previous one-hour revalidation window was
-    // short enough that a quiet afternoon left the next visitor waiting the full
-    // minute; a day means that effectively only a cold cache ever pays it. The
-    // view shows when the batch was analysed and offers a manual refresh, so
-    // slightly stale results are visible as such rather than passed off as live.
+    if (!signals.length) {
+      return res.status(500).json({ error: 'Analysis returned no usable signals' });
+    }
+
+    // The analysis is now split across concurrent calls, but a cold response is still
+    // the slowest of them rather than instant. The CDN serves the previous batch while
+    // a fresh one builds behind it, and the view shows when the batch was analysed and
+    // offers a manual refresh, so stale results read as stale.
     res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=86400');
-    return res.status(200).json({ signals, sources, fetchedAt: new Date().toISOString() });
+    return res.status(200).json({
+      signals,
+      sources,
+      // A partial result is worth returning, but not worth passing off as complete.
+      analysis: {
+        batches: analysed.length,
+        failedBatches: failedBatches.length,
+        storiesConsidered: top.length,
+      },
+      fetchedAt: new Date().toISOString(),
+    });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to generate signals', detail: err.message });
   }

@@ -649,7 +649,7 @@ function SignalsView({ filters, setFilters, onDataLoaded }) {
 
       {loading ? (
         <div className="space-y-3">
-          <p className="text-gray-500 text-xs animate-pulse mb-4">Reading {SOURCES.length} sources and analysing with AI… this can take up to a minute</p>
+          <p className="text-gray-500 text-xs animate-pulse mb-4">Reading {SOURCES.length} sources and analysing with AI… around half a minute</p>
           {Array.from({ length: 5 }).map((_, i) => (
             <div key={i} className="bg-dark-card border border-dark-border rounded-lg p-4 animate-pulse">
               <div className="h-3 bg-dark-border rounded w-20 mb-3" />

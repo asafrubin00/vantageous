@@ -83,7 +83,7 @@ The endpoint still declines rather than guessing where no model fits:
 
 Coverage is US SEC filers only.
 
-Two things beyond the choice of model shape that number. A ticker sometimes points at an entity that
+Two things beyond the choice of model shape that coverage. A ticker sometimes points at an entity that
 holds the listing but not the history — XOM maps to ExxonMobil Holdings Corp, a
 successor registrant with no 10-K, while the filings sit under Exxon Mobil Corp on a
 CIK the ticker map never mentions. Where the mapped entity has no annual history, the
@@ -160,7 +160,9 @@ The app will be available at `http://localhost:3000`.
 
 ## Caching
 
-Signal analysis is cached for 30 minutes at the CDN layer (`s-maxage=1800`) to avoid redundant Claude API calls, with a 24-hour `stale-while-revalidate` window. Fetching the feeds takes under a second; generating the analysis takes around a minute and accounts for essentially all of the response time. The revalidation window means a visitor is served the previous batch immediately while a fresh one builds in the background, so only a genuinely cold cache waits for the full call. Analyst ratings are cached for 24 hours. The Briefing feed refreshes every 20 minutes client-side.
+Signal analysis is cached for 30 minutes at the CDN layer (`s-maxage=1800`) to avoid redundant Claude API calls, with a 24-hour `stale-while-revalidate` window, so a visitor is served the previous batch immediately while a fresh one builds in the background.
+
+Fetching the feeds takes under a second; the analysis accounts for essentially all of the remaining time. It runs as three concurrent calls over a round-robin split of the stories rather than one long call, which brought a cold response from roughly 65 seconds to 26 for the same number of stories analysed and the same output. Dealing the stories round-robin rather than in contiguous slices gives each batch the same spread of freshness. A failed batch now costs a few stories instead of the whole response, and the response reports how many batches ran and how many failed. Analyst ratings are cached for 24 hours. The Briefing feed refreshes every 20 minutes client-side.
 DCF results are cached for an hour per ticker-and-assumption combination, and the valuation view
 debounces assumption changes so dragging a slider fires one request rather than thirty.
 
