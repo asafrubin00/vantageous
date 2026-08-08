@@ -17,6 +17,9 @@ const TAGS = {
   capex: [
     'PaymentsToAcquirePropertyPlantAndEquipment',
     'PaymentsToAcquireProductiveAssets',
+    // Verizon and other telecoms tag capex here. One word away from the entry
+    // above, and its absence silently cost the whole sector.
+    'PaymentsToAcquireOtherProductiveAssets',
     'PaymentsForCapitalImprovements',
     'PaymentsToAcquireOtherPropertyPlantAndEquipment',
   ],
@@ -46,6 +49,9 @@ const TAGS = {
 const STANDARD_CAPEX = new Set([
   'PaymentsToAcquirePropertyPlantAndEquipment',
   'PaymentsToAcquireProductiveAssets',
+  // Despite the "Other", this is Verizon's whole capital programme — roughly $17bn
+  // against $37bn of operating cash flow — not a subset of a larger line.
+  'PaymentsToAcquireOtherProductiveAssets',
   'PaymentsToAcquireOtherPropertyPlantAndEquipment',
 ]);
 
@@ -64,6 +70,49 @@ async function tickerToCik(ticker) {
   }
   // EDGAR writes class shares as BRK-B; people type BRK.B.
   return tickerMapCache.get(ticker.toUpperCase()) || tickerMapCache.get(ticker.toUpperCase().replace('.', '-'));
+}
+
+// A ticker can point at an entity that holds the listing but not the history. XOM
+// resolves to ExxonMobil Holdings Corp, a successor registrant with 10-Qs and an
+// 8-K12B but no 10-K, while three decades of filings sit under Exxon Mobil Corp on
+// a different CIK the ticker map never mentions. EDGAR's company search, restricted
+// to filers that have actually filed a 10-K, can find the entity holding the history.
+const CORPORATE_SUFFIXES = /\b(holdings?|corp(oration)?|inc(orporated)?|company|co|group|plc|ltd|limited|llc|lp|nv|sa|ag|the)\b\.?/gi;
+
+const squash = (s) => s.toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+// EDGAR matches company names by prefix, so a compound registrant name like
+// "ExxonMobil" never matches the registrant "EXXON MOBIL CORP". Progressively
+// shorter prefixes give the prefix match something to bite on.
+function searchTerms(name) {
+  const stripped = name.replace(CORPORATE_SUFFIXES, ' ').replace(/[^A-Za-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  const first = stripped.split(' ')[0] ?? '';
+  const terms = [stripped, first, first.slice(0, 8), first.slice(0, 6), first.slice(0, 5)];
+  return [...new Set(terms.map((t) => t.trim()).filter((t) => t.length >= 4))];
+}
+
+async function findFilingEntity(name, excludeCik) {
+  for (const term of searchTerms(name)) {
+    const url = `https://www.sec.gov/cgi-bin/browse-edgar?company=${encodeURIComponent(term)}&type=10-K&dateb=&owner=include&count=10&action=getcompany&output=atom`;
+    let xml;
+    try {
+      const r = await fetch(url, { headers: { 'User-Agent': UA } });
+      if (!r.ok) continue;
+      xml = await r.text();
+    } catch { continue; }
+
+    const ciks = [...xml.matchAll(/<cik>(\d+)<\/cik>/g)].map((m) => +m[1]);
+    const names = [...xml.matchAll(/<conformed-name>([^<]+)<\/conformed-name>/g)].map((m) => m[1]);
+
+    for (let i = 0; i < ciks.length; i++) {
+      // Only accept a candidate whose name genuinely extends the search term, so a
+      // short prefix cannot quietly substitute an unrelated company.
+      if (ciks[i] !== excludeCik && names[i] && squash(names[i]).startsWith(squash(term))) {
+        return { cik: ciks[i], name: names[i] };
+      }
+    }
+  }
+  return null;
 }
 
 async function companyFacts(cik) {
@@ -239,33 +288,63 @@ export default async function handler(req, res) {
       return res.status(404).json({ error: `${ticker.toUpperCase()} is not a US SEC filer — this tool covers US-listed stocks only.` });
     }
 
-    const { facts } = await companyFacts(match.cik);
     const warnings = [];
     const sources = {};
 
-    const ocfRef = resolve(facts, TAGS.ocf, 'USD');
-    if (!ocfRef) return res.status(422).json({ error: 'No operating cash flow reported in EDGAR for this filer.' });
+    // Read the mapped entity, and if it turns out to hold the listing but not the
+    // filings, follow the name to the registrant that does.
+    const read = async (entity) => {
+      const { facts } = await companyFacts(entity.cik);
+      const ocfRef = resolve(facts, TAGS.ocf, 'USD');
+      const capexRef = resolve(facts, TAGS.capex, 'USD');
+      if (!ocfRef || !capexRef) return { facts, ocfRef, capexRef, ocfAnnual: [], capexAnnual: [] };
+      return { facts, ocfRef, capexRef, ocfAnnual: annualSeries(ocfRef.entries), capexAnnual: annualSeries(capexRef.entries) };
+    };
 
-    const capexRef = resolve(facts, TAGS.capex, 'USD');
+    let entity = { cik: match.cik, name: match.name };
+    let read1 = await read(entity);
+    let substituted = null;
+
+    if (!read1.ocfAnnual.length || !read1.capexAnnual.length) {
+      const alt = await findFilingEntity(match.name, match.cik);
+      if (alt) {
+        const read2 = await read(alt);
+        if (read2.ocfAnnual.length && read2.capexAnnual.length) {
+          substituted = { from: match.name, to: alt.name, cik: alt.cik };
+          entity = alt;
+          read1 = read2;
+        }
+      }
+    }
+
+    const { facts, ocfRef, capexRef, ocfAnnual, capexAnnual } = read1;
+
+    if (!ocfRef) return res.status(422).json({ error: `No operating cash flow reported in EDGAR for ${entity.name}.` });
+
     if (!capexRef) {
       return res.status(422).json({
-        error: `${match.name} does not report capital expenditure — typical of banks and insurers.`,
+        error: `${entity.name} does not report capital expenditure under any standard tag.`,
         detail:
-          'Free-cash-flow DCF is not a valid model for financials. A dividend discount or residual income model is the right approach for this filer.',
+          'Banks and insurers do not report capital expenditure at all, and a free-cash-flow DCF is not a valid model for them — a dividend discount or residual income model is. Some capital-intensive filers, utilities in particular, do spend heavily but tag it in their own company namespace rather than a standard one, in which case the spending exists but cannot be read from these filings.',
         ticker: ticker.toUpperCase(),
-        company: match.name,
+        company: entity.name,
       });
     }
-    const ocfAnnual = annualSeries(ocfRef.entries);
-    const capexAnnual = annualSeries(capexRef.entries);
+
     if (!ocfAnnual.length || !capexAnnual.length) {
       return res.status(422).json({
-        error: `No annual (10-K) cash flow history found for ${match.name}.`,
+        error: `No annual (10-K) cash flow history found for ${entity.name}.`,
         detail:
-          'The ticker resolved to a SEC registrant with little or no filing history — often a recently reorganised entity whose historic filings sit under a different CIK.',
+          'The ticker resolved to a SEC registrant with little or no filing history — often a recently reorganised entity — and no predecessor registrant with a 10-K history could be matched to it.',
         ticker: ticker.toUpperCase(),
-        company: match.name,
+        company: entity.name,
       });
+    }
+
+    if (substituted) {
+      warnings.push(
+        `${ticker.toUpperCase()} maps to ${substituted.from}, which has no 10-K history. Figures are taken from ${substituted.to} (CIK ${substituted.cik}), the registrant holding the filings.`
+      );
     }
 
     // Pair the two series by fiscal period end so a missing year can't misalign them.
@@ -292,11 +371,11 @@ export default async function handler(req, res) {
     const capexLagYears = latestOcfYear - +latestFy.periodEnd.slice(0, 4);
     if (capexLagYears >= 2) {
       return res.status(422).json({
-        error: `${match.name} last reported capital expenditure for ${latestFy.periodEnd.slice(0, 4)}, but has cash flow through ${latestOcfYear}.`,
+        error: `${entity.name} last reported capital expenditure for ${latestFy.periodEnd.slice(0, 4)}, but has cash flow through ${latestOcfYear}.`,
         detail:
           'Free cash flow cannot be built for recent periods, so any valuation would mix stale investment spend with a current balance sheet. This is common for REITs, which tag property acquisitions rather than maintenance capex.',
         ticker: ticker.toUpperCase(),
-        company: match.name,
+        company: entity.name,
         history,
       });
     }
@@ -369,10 +448,10 @@ export default async function handler(req, res) {
 
     if (baseFcf <= 0) {
       return res.status(422).json({
-        error: `${match.name} has negative free cash flow on the selected basis — a DCF cannot produce a meaningful value.`,
+        error: `${entity.name} has negative free cash flow on the selected basis — a DCF cannot produce a meaningful value.`,
         baseFreeCashFlow: baseFcf,
         ticker: ticker.toUpperCase(),
-        company: match.name,
+        company: entity.name,
         history,
       });
     }
@@ -420,8 +499,8 @@ export default async function handler(req, res) {
     res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate=86400');
     return res.status(200).json({
       ticker: ticker.toUpperCase(),
-      company: match.name,
-      cik: match.cik,
+      company: entity.name,
+      cik: entity.cik,
       quote,
       assumptions: {
         wacc,

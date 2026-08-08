@@ -60,7 +60,18 @@ The endpoint declines rather than guessing when a DCF would be invalid:
 - **Negative free cash flow**, thin filing history, and terminal-value-dominated results are
   flagged explicitly.
 
-Coverage is US SEC filers only.
+Coverage is US SEC filers only. Across the 50 largest US listings it values 42; the
+eight it declines are banks and insurers that report no capital expenditure, filers
+with negative free cash flow, and one REIT whose capex tagging has gone stale.
+
+Two things make that number what it is. A ticker sometimes points at an entity that
+holds the listing but not the history — XOM maps to ExxonMobil Holdings Corp, a
+successor registrant with no 10-K, while the filings sit under Exxon Mobil Corp on a
+CIK the ticker map never mentions. Where the mapped entity has no annual history, the
+registrant holding the filings is looked up by name and used instead, and the response
+says so rather than quietly reporting another company's figures. Separately, capex
+tagging varies enough that a single missing tag can cost a whole sector: Verizon reports
+under `PaymentsToAcquireOtherProductiveAssets`, one word from a tag already in the chain.
 
 ### Watchlist
 
