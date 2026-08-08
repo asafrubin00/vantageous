@@ -337,19 +337,28 @@ export default async function handler(req, res) {
       const { facts } = await companyFacts(entity.cik);
       const ocfRef = resolve(facts, TAGS.ocf, 'USD');
       const capexRef = resolve(facts, TAGS.capex, 'USD');
-      if (!ocfRef || !capexRef) return { facts, ocfRef, capexRef, ocfAnnual: [], capexAnnual: [] };
-      return { facts, ocfRef, capexRef, ocfAnnual: annualSeries(ocfRef.entries), capexAnnual: annualSeries(capexRef.entries) };
+      return {
+        facts,
+        ocfRef,
+        capexRef,
+        ocfAnnual: ocfRef ? annualSeries(ocfRef.entries) : [],
+        capexAnnual: capexRef ? annualSeries(capexRef.entries) : [],
+      };
     };
 
     let entity = { cik: match.cik, name: match.name };
     let read1 = await read(entity);
     let substituted = null;
 
-    if (!read1.ocfAnnual.length || !read1.capexAnnual.length) {
+    // Only a filer with no annual cash flow at all is a candidate for having its
+    // history filed under another registrant. A missing capex tag is a different
+    // thing entirely — every bank lacks one — and searching EDGAR for a
+    // predecessor that does not exist cost them around a minute each.
+    if (!read1.ocfAnnual.length) {
       const alt = await findFilingEntity(match.name, match.cik);
       if (alt) {
         const read2 = await read(alt);
-        if (read2.ocfAnnual.length && read2.capexAnnual.length) {
+        if (read2.ocfAnnual.length) {
           substituted = { from: match.name, to: alt.name, cik: alt.cik };
           entity = alt;
           read1 = read2;
