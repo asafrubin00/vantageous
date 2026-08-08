@@ -168,11 +168,34 @@ function saveHistory(history) {
   } catch { /* private mode, or quota */ }
 }
 
+// Every valuation is also filed to the shared server record, so history compounds
+// across devices and visits rather than living in one browser. Fire and forget: the
+// local copy is what the view reads immediately, and a failed write must not disturb
+// a valuation the reader is looking at.
+function postSnapshot(ticker, data, assumptions) {
+  try {
+    fetch('/api/history', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        ticker,
+        price: data.quote.price,
+        fairValue: data.valuation.perShare,
+        upside: data.verdict.upside,
+        model: data.model?.kind ?? 'free-cash-flow',
+        company: data.company,
+        fingerprint: assumptionFingerprint(assumptions),
+      }),
+    }).catch(() => {});
+  } catch { /* offline */ }
+}
+
 // One snapshot per ticker per day per fingerprint — re-running the same valuation
 // an hour later is not a new observation.
 function recordSnapshot(ticker, data, assumptions) {
   if (!data?.quote?.price || data.verdict?.upside === null || data.verdict?.upside === undefined) return;
 
+  postSnapshot(ticker, data, assumptions);
   const history = loadHistory();
   const snapshot = {
     d: today(),
@@ -187,6 +210,45 @@ function recordSnapshot(ticker, data, assumptions) {
   const withoutToday = existing.filter((s) => !(s.d === snapshot.d && s.a === snapshot.a));
   history[ticker] = [...withoutToday, snapshot].slice(-MAX_SNAPSHOTS);
   saveHistory(history);
+}
+
+// The shared record is the fuller one — it keeps accruing on days nobody opens the
+// app — but the local copy is instant and survives the server being unavailable, so
+// the two are merged with the server winning on any day both have.
+function mergeHistories(local, server) {
+  const merged = { ...local };
+  for (const [ticker, serverRows] of Object.entries(server ?? {})) {
+    const byDay = new Map((merged[ticker] ?? []).map((s) => [`${s.d}|${s.a}`, s]));
+    for (const row of serverRows) byDay.set(`${row.d}|${row.a}`, row);
+    merged[ticker] = [...byDay.values()].sort((a, b) => a.d.localeCompare(b.d));
+  }
+  return merged;
+}
+
+function useSharedHistory(tickers, assumptions, refreshKey) {
+  const [server, setServer] = useState({});
+  const key = tickers.join(',');
+  const fingerprint = assumptionFingerprint(assumptions);
+
+  useEffect(() => {
+    if (!tickers.length) { setServer({}); return; }
+    let cancelled = false;
+    fetch(`/api/history?tickers=${encodeURIComponent(key)}&fingerprint=${encodeURIComponent(fingerprint)}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (cancelled || !j?.snapshots) return;
+        // Stamp the fingerprint back on, since the server filtered by it rather
+        // than returning it per row.
+        const stamped = Object.fromEntries(
+          Object.entries(j.snapshots).map(([t, rows]) => [t, rows.map((r) => ({ ...r, a: fingerprint }))])
+        );
+        setServer(stamped);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [key, fingerprint, refreshKey]);
+
+  return server;
 }
 
 // Compare the newest snapshot with the most recent one from an earlier day that
@@ -1262,7 +1324,9 @@ function WatchlistPanel({ tickers, assumptions, onSelect, onRemove, heading = 'W
   // Re-read once the current pass has finished writing, so the column reflects the
   // snapshot just taken rather than the one before it.
   const settled = tickers.filter((t) => rows[t] && rows[t].state !== 'loading').length;
-  const history = useMemo(loadHistory, [settled, assumptionFingerprint(assumptions)]);
+  const local = useMemo(loadHistory, [settled, assumptionFingerprint(assumptions)]);
+  const server = useSharedHistory(tickers, assumptions, settled);
+  const history = useMemo(() => mergeHistories(local, server), [local, server]);
   const changes = Object.fromEntries(tickers.map((t) => [t, changeFor(t, assumptions, history)]));
   const anyChange = Object.values(changes).some(Boolean);
 

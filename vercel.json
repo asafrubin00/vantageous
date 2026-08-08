@@ -15,5 +15,8 @@
   ],
   "rewrites": [
     { "source": "/((?!api/|@vite|@react-refresh|node_modules|src/).*)","destination": "/index.html" }
+  ],
+  "crons": [
+    { "path": "/api/snapshot-daily", "schedule": "0 6 * * *" }
   ]
 }
