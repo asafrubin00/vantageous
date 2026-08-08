@@ -132,6 +132,85 @@ function saveAssumptions(a) {
   try { localStorage.setItem(ASSUMPTIONS_KEY, JSON.stringify(a)); } catch { /* private mode */ }
 }
 
+// ── Valuation history ─────────────────────────────────────────────────────────
+//
+// Fair value moves when the company's filings change and when you move a slider,
+// and only the first of those is news. Every snapshot therefore carries a
+// fingerprint of the assumptions that produced it, and a change is only ever
+// reported between snapshots sharing one. Otherwise nudging the discount rate
+// would read as the market repricing.
+
+const HISTORY_KEY = 'vantageous.valuations';
+const MAX_SNAPSHOTS = 60;
+const MAX_TRACKED = 100;
+
+const assumptionFingerprint = (a) =>
+  `${a.wacc}|${a.growth}|${a.terminalGrowth}|${a.years}|${a.basis}`;
+
+const today = () => new Date().toISOString().slice(0, 10);
+
+function loadHistory() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(HISTORY_KEY) || '{}');
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  } catch { return {}; }
+}
+
+function saveHistory(history) {
+  try {
+    // Evict the least recently updated tickers rather than letting this grow forever.
+    const entries = Object.entries(history);
+    if (entries.length > MAX_TRACKED) {
+      entries.sort((a, b) => (b[1].at(-1)?.d ?? '').localeCompare(a[1].at(-1)?.d ?? ''));
+      history = Object.fromEntries(entries.slice(0, MAX_TRACKED));
+    }
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  } catch { /* private mode, or quota */ }
+}
+
+// One snapshot per ticker per day per fingerprint — re-running the same valuation
+// an hour later is not a new observation.
+function recordSnapshot(ticker, data, assumptions) {
+  if (!data?.quote?.price || data.verdict?.upside === null || data.verdict?.upside === undefined) return;
+
+  const history = loadHistory();
+  const snapshot = {
+    d: today(),
+    p: +data.quote.price.toFixed(2),
+    f: data.valuation.perShare,
+    u: data.verdict.upside,
+    m: data.model?.kind ?? 'free-cash-flow',
+    a: assumptionFingerprint(assumptions),
+  };
+
+  const existing = history[ticker] ?? [];
+  const withoutToday = existing.filter((s) => !(s.d === snapshot.d && s.a === snapshot.a));
+  history[ticker] = [...withoutToday, snapshot].slice(-MAX_SNAPSHOTS);
+  saveHistory(history);
+}
+
+// Compare the newest snapshot with the most recent one from an earlier day that
+// used the same assumptions. Nothing comparable means no claim is made.
+function changeFor(ticker, assumptions, history) {
+  const fingerprint = assumptionFingerprint(assumptions);
+  const series = (history[ticker] ?? []).filter((s) => s.a === fingerprint);
+  if (series.length < 2) return null;
+
+  const latest = series[series.length - 1];
+  const prior = [...series].reverse().find((s) => s.d !== latest.d);
+  if (!prior) return null;
+
+  const days = Math.max(1, Math.round((Date.parse(latest.d) - Date.parse(prior.d)) / 86400000));
+  return {
+    days,
+    upsideDelta: latest.u - prior.u,
+    priceDelta: prior.p ? latest.p / prior.p - 1 : null,
+    fairValueDelta: prior.f ? latest.f / prior.f - 1 : null,
+    from: prior,
+    to: latest,
+  };
+}
+
 function timeAgo(dateStr) {
   const s = Math.floor((Date.now() - new Date(dateStr)) / 1000);
   if (s < 60) return 'just now';
@@ -1160,6 +1239,7 @@ function useWatchlistValuations(tickers, assumptions) {
             const res = await fetch(`/api/dcf?${new URLSearchParams({ ticker, ...assumptions })}`);
             const json = await res.json();
             if (cancelled) return;
+            if (res.ok) recordSnapshot(ticker, json, assumptions);
             setRows((prev) => ({ ...prev, [ticker]: res.ok ? { state: 'ok', data: json } : { state: 'error', error: json } }));
           } catch (err) {
             if (!cancelled) setRows((prev) => ({ ...prev, [ticker]: { state: 'error', error: { error: 'Could not reach the valuation service' } } }));
@@ -1178,6 +1258,13 @@ function useWatchlistValuations(tickers, assumptions) {
 
 function WatchlistPanel({ tickers, assumptions, onSelect, onRemove, heading = 'Watchlist' }) {
   const rows = useWatchlistValuations(tickers, assumptions);
+
+  // Re-read once the current pass has finished writing, so the column reflects the
+  // snapshot just taken rather than the one before it.
+  const settled = tickers.filter((t) => rows[t] && rows[t].state !== 'loading').length;
+  const history = useMemo(loadHistory, [settled, assumptionFingerprint(assumptions)]);
+  const changes = Object.fromEntries(tickers.map((t) => [t, changeFor(t, assumptions, history)]));
+  const anyChange = Object.values(changes).some(Boolean);
 
   // Cheapest first, so the list answers "what looks interesting today" at a glance.
   // Anything without a verdict sorts to the bottom rather than pretending to rank.
@@ -1206,6 +1293,7 @@ function WatchlistPanel({ tickers, assumptions, onSelect, onRemove, heading = 'W
               <th className="text-right font-normal p-1.5">Price</th>
               <th className="text-right font-normal p-1.5">Fair value</th>
               <th className="text-right font-normal p-1.5">Upside</th>
+              {anyChange && <th className="text-right font-normal p-1.5">Change</th>}
               <th className="w-6" />
             </tr>
           </thead>
@@ -1240,6 +1328,21 @@ function WatchlistPanel({ tickers, assumptions, onSelect, onRemove, heading = 'W
                   <td className={`p-1.5 text-right font-mono ${tone}`}>
                     {row?.state === 'loading' ? '' : upside === null ? 'n/a' : fmtPct(upside)}
                   </td>
+                  {anyChange && (
+                    <td className="p-1.5 text-right font-mono">
+                      {changes[ticker] ? (
+                        <span
+                          className={changes[ticker].upsideDelta > 0 ? 'text-emerald-400' : changes[ticker].upsideDelta < 0 ? 'text-red-400' : 'text-gray-600'}
+                          title={`Upside moved ${fmtPct(changes[ticker].upsideDelta)} over ${changes[ticker].days} day${changes[ticker].days === 1 ? '' : 's'} — price ${fmtPct(changes[ticker].priceDelta)}, fair value ${fmtPct(changes[ticker].fairValueDelta)}, same assumptions`}
+                        >
+                          {fmtPct(changes[ticker].upsideDelta)}
+                          <span className="text-gray-700 ml-1">{changes[ticker].days}d</span>
+                        </span>
+                      ) : (
+                        <span className="text-gray-700">—</span>
+                      )}
+                    </td>
+                  )}
                   <td className="p-1.5 text-right">
                     <button
                       onClick={() => onRemove(ticker)}
@@ -1255,6 +1358,19 @@ function WatchlistPanel({ tickers, assumptions, onSelect, onRemove, heading = 'W
           </tbody>
         </table>
       </div>
+
+      {anyChange ? (
+        <p className="text-[10px] text-gray-600 mt-2.5 leading-relaxed">
+          Change compares today against the last time this list was opened with these same
+          assumptions. Adjusting a slider starts a fresh comparison rather than showing the
+          move as if the market had made it.
+        </p>
+      ) : (
+        <p className="text-[10px] text-gray-600 mt-2.5 leading-relaxed">
+          Tracking from today. Open this list again another day and a change column appears,
+          comparing like with like.
+        </p>
+      )}
 
       {/* A DCF legitimately does not apply to some filers. Saying so beside the row
           is more useful than leaving a dash the reader has to interpret. */}
@@ -1305,7 +1421,7 @@ function ValuationView({ ticker, onTicker }) {
         const res = await fetch(`/api/dcf?${qs}`);
         const json = await res.json();
         if (cancelled) return;
-        if (res.ok) { setData(json); setError(null); }
+        if (res.ok) { recordSnapshot(ticker, json, assumptions); setData(json); setError(null); }
         else { setError(json); setData(null); }
       } catch (err) {
         if (!cancelled) { setError({ error: 'Could not reach the valuation service', detail: err.message }); setData(null); }

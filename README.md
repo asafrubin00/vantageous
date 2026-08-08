@@ -99,6 +99,23 @@ valuation view. Every entry is valued against whatever assumptions are currently
 so moving the discount rate re-rates the whole list at once rather than one name at a
 time, and the list sorts cheapest-first on upside.
 
+Each successful valuation is snapshotted, and the list gains a change column comparing
+today with the last day it was opened: how far the gap between price and fair value has
+moved, and over how many days.
+
+Fair value moves both when a company's filings change and when you move a slider, and
+only the first is news. Every snapshot therefore records a fingerprint of the assumptions
+behind it, and a change is only reported between snapshots sharing one. Dropping the
+discount rate from 9% to 7% takes AT&T's fair value from $31.25 to $53.55 — reporting
+that as a 94-point move in upside would be claiming the market did something the reader
+did. Changing an assumption starts a fresh comparison instead, and switching back picks
+the original series up again. One snapshot is kept per ticker per day per fingerprint,
+capped at 60 per ticker and 100 tickers, evicting least-recently-updated.
+
+History is per-browser and only accrues on days the list is opened — there is no server
+or account behind it. A gap in visits is a gap in the record, and the change column says
+how many days it is actually comparing rather than implying a daily series.
+
 The watchlist and the assumptions both persist in `localStorage` — assumptions are your
 own view of risk and growth, and a saved list re-rated against defaults each session
 would not be yours. Each ticker is requested separately rather than through a batch
