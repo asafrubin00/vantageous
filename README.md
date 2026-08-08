@@ -50,21 +50,40 @@ Alongside the point estimate it shows:
 Fundamentals are pulled from SEC EDGAR's XBRL `companyfacts` API and the trailing-twelve-month
 figure is rolled forward from interim filings, since the last 10-K can be nearly a year old.
 
-The endpoint declines rather than guessing when a DCF would be invalid:
+### When free cash flow cannot be built
 
-- **Banks and insurers** do not tag capital expenditure, so free cash flow cannot be built —
-  a dividend discount or residual income model is the right tool for those.
-- **Filers whose capex coverage has gone stale** (common for REITs, which tag property
-  acquisitions rather than maintenance capex) would otherwise mix decade-old investment spend
-  with a current balance sheet.
-- **Negative free cash flow**, thin filing history, and terminal-value-dominated results are
-  flagged explicitly.
+Banks, insurers, REITs and some utilities report no capital expenditure that can be read
+from standard tags, so free cash flow cannot be constructed for them at all. These are
+exactly the filers a dividend discount model is meant for, so rather than refusing, the
+endpoint values the dividend stream instead and says plainly that it has done so — the
+response carries the model used and why, and the view labels its inputs to match.
 
-Coverage is US SEC filers only. Across the 50 largest US listings it values 42; the
-eight it declines are banks and insurers that report no capital expenditure, filers
-with negative free cash flow, and one REIT whose capex tagging has gone stale.
+A dividend model counts only cash actually paid out, so a company returning capital
+through buybacks looks cheaper on this basis than it is. That caveat is attached to
+every such valuation rather than left for the reader to remember.
 
-Two things make that number what it is. A ticker sometimes points at an entity that
+Dividend tags need their own selection rule. Prologis reports
+`CommonStockDividendsPerShareDeclared` as $0.02, $0.00, $0.01 and $0.03 while its actual
+dividend of $3.16 to $4.04 sits in `CommonStockDividendsPerShareCashPaid`, both tags
+covering the same years. Tag priority alone picked the artifact and valued the company
+at a fiftieth of its dividend, so within a period the larger figure wins across tags
+while restatements of the same tag still resolve by filing date.
+
+Across the 50 largest US listings, 42 are valued on free cash flow and 7 on dividends.
+The one refusal is Amazon, which has negative free cash flow and pays no dividend, so
+neither model applies.
+
+The endpoint still declines rather than guessing where no model fits:
+
+- **Filers with neither usable capital expenditure nor a dividend history** — there is no
+  stream to discount either way.
+- **Negative free cash flow with no dividend to fall back on.**
+- Thin filing history and terminal-value-dominated results are flagged explicitly rather
+  than refused.
+
+Coverage is US SEC filers only.
+
+Two things beyond the choice of model shape that number. A ticker sometimes points at an entity that
 holds the listing but not the history — XOM maps to ExxonMobil Holdings Corp, a
 successor registrant with no 10-K, while the filings sit under Exxon Mobil Corp on a
 CIK the ticker map never mentions. Where the mapped entity has no annual history, the

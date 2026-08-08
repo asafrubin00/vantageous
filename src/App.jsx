@@ -896,6 +896,15 @@ function fmtPct(n, digits = 1) {
   return n === null || n === undefined ? '—' : `${n > 0 ? '+' : ''}${(n * 100).toFixed(digits)}%`;
 }
 
+const isDividendModel = (data) => data?.model?.kind === 'dividend-discount';
+
+// The two models measure different things — a whole-company cash flow in billions,
+// or a per-share dividend in dollars — so the same formatter cannot serve both.
+function fmtStream(value, dividend) {
+  if (value === null || value === undefined) return '—';
+  return dividend ? `$${value.toFixed(2)}/share` : fmtMoney(value);
+}
+
 function Assumption({ label, value, onChange, min, max, step, suffix = '%', hint }) {
   return (
     <div className="bg-dark/40 border border-dark-border/60 rounded p-2.5">
@@ -947,7 +956,8 @@ function VerdictCard({ data }) {
           <span className={`text-sm font-mono ${tone}`}>{fmtPct(verdict.upside)}</span>
         )}
         <span className="text-[11px] text-gray-600 ml-auto">
-          vs {BASIS_LABELS[data.assumptions.basis]} FCF of {fmtMoney(data.assumptions.baseFreeCashFlow)}
+          vs {BASIS_LABELS[data.assumptions.basis]} {isDividendModel(data) ? 'dividends' : 'FCF'} of{' '}
+          {fmtStream(data.assumptions.baseValue ?? data.assumptions.baseFreeCashFlow, isDividendModel(data))}
         </span>
       </div>
     </div>
@@ -1019,7 +1029,8 @@ function SensitivityGrid({ sensitivity, price }) {
   );
 }
 
-function HistoryStrip({ history }) {
+function HistoryStrip({ history, dividend }) {
+  const valueOf = (h) => (dividend ? h.dividendPerShare : h.freeCashFlow);
   // Filers change tags mid-history and leave gaps — NVIDIA has 2010-2012 and then
   // nothing until 2022. Drawing those as neighbouring bars would imply a continuous
   // series, so only the unbroken run up to the latest year is charted.
@@ -1031,21 +1042,21 @@ function HistoryStrip({ history }) {
   }
   const omitted = history.length - contiguous.length;
   const recent = contiguous.slice(-8);
-  const max = Math.max(...recent.map((h) => Math.abs(h.freeCashFlow)), 1);
+  const max = Math.max(...recent.map((h) => Math.abs(valueOf(h))), 1);
 
   if (!recent.length) return null;
 
   return (
     <div className="bg-dark-card border border-dark-border rounded-lg p-4">
-      <h3 className="text-sm text-gray-200 mb-3">Free cash flow history</h3>
+      <h3 className="text-sm text-gray-200 mb-3">{dividend ? 'Dividend per share history' : 'Free cash flow history'}</h3>
       <div className="flex items-end gap-1.5 h-24">
         {recent.map((h) => {
-          const pct = Math.max((Math.abs(h.freeCashFlow) / max) * 100, 2);
-          const negative = h.freeCashFlow < 0;
+          const pct = Math.max((Math.abs(valueOf(h)) / max) * 100, 2);
+          const negative = valueOf(h) < 0;
           return (
             <div key={h.periodEnd} className="flex-1 flex flex-col items-center justify-end h-full group">
               <span className="text-[9px] text-gray-500 mb-1 opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">
-                {fmtMoney(h.freeCashFlow)}
+                {fmtStream(valueOf(h), dividend)}
               </span>
               <div
                 className={`w-full rounded-sm ${negative ? 'bg-red-500/40' : 'bg-salmon/35 group-hover:bg-salmon/60'} transition-colors`}
@@ -1059,7 +1070,7 @@ function HistoryStrip({ history }) {
       {omitted > 0 && (
         <p className="text-[10px] text-gray-600 mt-2.5 leading-tight">
           {omitted} earlier year{omitted === 1 ? '' : 's'} on file but not contiguous with this run —
-          the filer changed or dropped its capex tag in between.
+          the filer changed or dropped the underlying tag in between.
         </p>
       )}
     </div>
@@ -1068,6 +1079,7 @@ function HistoryStrip({ history }) {
 
 function Provenance({ data }) {
   const { inputs, sources, assumptions, alternativeBases } = data;
+  const dividend = isDividendModel(data);
   const row = (label, value, sub) => (
     <div className="flex items-baseline justify-between gap-3 py-1.5 border-b border-dark-border/40 last:border-0">
       <span className="text-[11px] text-gray-500 shrink-0">{label}</span>
@@ -1082,18 +1094,28 @@ function Provenance({ data }) {
     <div className="bg-dark-card border border-dark-border rounded-lg p-4">
       <h3 className="text-sm text-gray-200 mb-1">Model inputs</h3>
       <p className="text-[11px] text-gray-600 mb-3">Straight from SEC filings — check these if a result looks wrong.</p>
-      {row('Base free cash flow', fmtMoney(assumptions.baseFreeCashFlow), `through ${assumptions.baseFreeCashFlowThrough ?? '—'}`)}
-      {row('— trailing 12m', fmtMoney(alternativeBases.ttm))}
-      {row('— last fiscal year', fmtMoney(alternativeBases.lastFy))}
-      {row('— 3yr average', fmtMoney(alternativeBases.avg3))}
+      {row(dividend ? 'Base dividend' : 'Base free cash flow', fmtStream(assumptions.baseValue ?? assumptions.baseFreeCashFlow, dividend), `through ${assumptions.baseFreeCashFlowThrough ?? '—'}`)}
+      {row('— trailing 12m', fmtStream(alternativeBases.ttm, dividend))}
+      {row('— last fiscal year', fmtStream(alternativeBases.lastFy, dividend))}
+      {row('— 3yr average', fmtStream(alternativeBases.avg3, dividend))}
       {row('Cash & equivalents', fmtMoney(inputs.cash))}
       {row('Short-term investments', fmtMoney(inputs.shortTermInvestments))}
       {row('Total debt', fmtMoney(inputs.totalDebt))}
       {row('Net debt', fmtMoney(inputs.netDebt), inputs.asOf ? `as of ${inputs.asOf}` : '')}
-      {row('Diluted shares', `${(inputs.shares / 1e9).toFixed(3)}B`)}
+      {inputs.shares && row('Diluted shares', `${(inputs.shares / 1e9).toFixed(3)}B`)}
       {inputs.coverPageShares && row('Cover-page shares', `${(inputs.coverPageShares / 1e9).toFixed(3)}B`)}
-      {row('Enterprise value', fmtMoney(data.valuation.enterpriseValue))}
+      {!dividend && row('Enterprise value', fmtMoney(data.valuation.enterpriseValue))}
       {row('Terminal value share', `${(data.valuation.terminalShare * 100).toFixed(0)}%`)}
+
+      {/* A per-share dividend stream is already net of everything the company owes,
+          so the balance sheet above is context rather than an input. */}
+      {dividend && (
+        <p className="text-[10px] text-gray-600 mt-2 leading-relaxed">
+          The balance sheet figures above are shown for context only — a dividend stream is
+          already per-share and already net of debt, so neither net debt nor the share count
+          enters this valuation.
+        </p>
+      )}
 
       <details className="mt-3">
         <summary className="text-[11px] text-gray-600 hover:text-salmon-dim cursor-pointer transition-colors">
@@ -1348,7 +1370,8 @@ function ValuationView({ ticker, onTicker }) {
                 hint="Your required annual return. Higher means you demand more compensation for risk."
               />
               <Assumption
-                label="Initial FCF growth" value={assumptions.growth} onChange={(v) => set('growth', v)}
+                label={isDividendModel(data) ? 'Initial dividend growth' : 'Initial FCF growth'}
+                value={assumptions.growth} onChange={(v) => set('growth', v)}
                 min={-10} max={40} step={0.5}
                 hint="Year-one growth, fading linearly to the terminal rate."
               />
@@ -1365,7 +1388,7 @@ function ValuationView({ ticker, onTicker }) {
             </div>
 
             <div className="bg-dark/40 border border-dark-border/60 rounded p-2.5">
-              <p className="text-[11px] text-gray-400 mb-2">Cash flow basis</p>
+              <p className="text-[11px] text-gray-400 mb-2">{isDividendModel(data) ? 'Dividend basis' : 'Cash flow basis'}</p>
               <div className="flex gap-1">
                 {Object.entries(BASIS_LABELS).map(([key, label]) => (
                   <button
@@ -1419,6 +1442,16 @@ function ValuationView({ ticker, onTicker }) {
                   {data.quote?.exchange && (
                     <span className="text-[10px] text-gray-600 uppercase tracking-wide">{data.quote.exchange}</span>
                   )}
+                  {/* Which model produced the number matters as much as the number. */}
+                  <span
+                    className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                      isDividendModel(data)
+                        ? 'text-sky-300 border-sky-400/30 bg-sky-400/10'
+                        : 'text-gray-500 border-dark-border'
+                    }`}
+                  >
+                    {data.model?.label ?? 'Discounted free cash flow'}
+                  </span>
                   <button
                     onClick={() => toggleWatch(data.ticker)}
                     title={watched ? `Remove ${data.ticker} from watchlist` : `Add ${data.ticker} to watchlist`}
@@ -1453,7 +1486,7 @@ function ValuationView({ ticker, onTicker }) {
                   )}
 
                   <SensitivityGrid sensitivity={data.sensitivity} price={data.quote?.price} />
-                  {data.history.length > 1 && <HistoryStrip history={data.history} />}
+                  {data.history.length > 1 && <HistoryStrip history={data.history} dividend={isDividendModel(data)} />}
                   <Provenance data={data} />
 
                   <p className="text-gray-700 text-[10px] text-center leading-relaxed">

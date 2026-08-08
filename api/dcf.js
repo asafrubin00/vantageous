@@ -41,6 +41,13 @@ const TAGS = {
   shortTermDebt: ['LongTermDebtCurrent', 'DebtCurrent', 'ShortTermBorrowings'],
   dilutedShares: ['WeightedAverageNumberOfDilutedSharesOutstanding'],
   coverShares: ['EntityCommonStockSharesOutstanding'],
+  // Banks, insurers and REITs report no usable capital expenditure, so free cash
+  // flow cannot be built for them at all. What they do report is dividends, which
+  // is the basis of the standard alternative model for exactly these filers.
+  dividendPerShare: [
+    'CommonStockDividendsPerShareDeclared',
+    'CommonStockDividendsPerShareCashPaid',
+  ],
 };
 
 // Ordinary synonyms for capital expenditure. Anything outside this set is a
@@ -148,31 +155,44 @@ function better(a, b) {
   return a.filed > b.filed ? a : b;
 }
 
-function dedupeByPeriod(entries, keyFn) {
+// Dividend tags need a different rule from the rest. Prologis reports
+// CommonStockDividendsPerShareDeclared as $0.02, $0.00, $0.01, $0.03 while its
+// actual dividend sits in CommonStockDividendsPerShareCashPaid at $3.16 to $4.04 —
+// both tags covering the same years. Tag priority would pick the artifact and value
+// the company at a fiftieth of its dividend, so within a period the larger figure
+// wins across tags, while restatements of the same tag still resolve by filing date.
+function betterDividend(a, b) {
+  if (!a) return b;
+  if (a.tag === b.tag) return a.filed > b.filed ? a : b;
+  return a.val >= b.val ? a : b;
+}
+
+function dedupeByPeriod(entries, keyFn, pick = better) {
   const best = new Map();
   for (const e of entries) {
     const k = keyFn(e);
-    best.set(k, better(best.get(k), e));
+    best.set(k, pick(best.get(k), e));
   }
   return [...best.values()];
 }
 
-function annualSeries(entries) {
+function annualSeries(entries, pick = better) {
   const annual = entries.filter((e) => {
     if (e.form !== '10-K' || !e.start) return false;
     const days = (Date.parse(e.end) - Date.parse(e.start)) / DAY;
     return days >= 330 && days <= 400; // exclude quarterly rows carried inside a 10-K
   });
-  return dedupeByPeriod(annual, (e) => `${e.start}:${e.end}`).sort((a, b) => a.end.localeCompare(b.end));
+  return dedupeByPeriod(annual, (e) => `${e.start}:${e.end}`, pick).sort((a, b) => a.end.localeCompare(b.end));
 }
 
 // The last 10-K can be nearly a year old. Roll it forward using year-to-date figures
 // from the interim filings: TTM = last full year + current YTD - prior-year same YTD.
-function trailingTwelveMonths(entries, latestAnnual) {
+function trailingTwelveMonths(entries, latestAnnual, pick = better) {
   if (!latestAnnual) return null;
   const durations = dedupeByPeriod(
     entries.filter((e) => e.start),
-    (e) => `${e.start}:${e.end}`
+    (e) => `${e.start}:${e.end}`,
+    pick
   );
 
   const ytd = durations
@@ -196,6 +216,26 @@ function latestInstant(entries) {
   const instants = dedupeByPeriod(entries.filter((e) => !e.start), (e) => e.end);
   if (!instants.length) return null;
   return instants.sort((a, b) => b.end.localeCompare(a.end))[0];
+}
+
+// Dividends per share are already a per-share figure, so a dividend discount model
+// needs no share count and no net debt bridge — the discounted stream is the value
+// of a share directly. That lets it reuse the same projection maths as the cash flow
+// model by passing a net debt of zero against a single share.
+function dividendPlan(facts) {
+  const ref = resolve(facts, TAGS.dividendPerShare, 'USD/shares');
+  if (!ref) return null;
+
+  const annual = annualSeries(ref.entries, betterDividend);
+  if (!annual.length) return null;
+
+  const history = annual.map((e) => ({ periodEnd: e.end, dividendPerShare: e.val, tag: e.tag }));
+  const latestFy = history[history.length - 1];
+  const ttmRaw = trailingTwelveMonths(ref.entries, annual[annual.length - 1], betterDividend);
+  const ttm = ttmRaw ? { dividendPerShare: ttmRaw.val, through: ttmRaw.through } : null;
+  const avg3 = history.slice(-3).reduce((s, h) => s + h.dividendPerShare, 0) / Math.min(3, history.length);
+
+  return { history, latestFy, ttm, avg3, tag: annual[annual.length - 1].tag };
 }
 
 async function spotPrice(ticker) {
@@ -321,17 +361,65 @@ export default async function handler(req, res) {
 
     if (!ocfRef) return res.status(422).json({ error: `No operating cash flow reported in EDGAR for ${entity.name}.` });
 
+    // The filers a cash flow model cannot touch — banks, insurers, REITs, utilities
+    // tagging capex privately — are precisely the ones a dividend discount model is
+    // meant for. Building that instead is a better answer than refusing, provided it
+    // is labelled as a different model rather than passed off as the same one.
+    const buildDividendModel = (because) => {
+      const dp = dividendPlan(facts);
+      if (!dp) return null;
+
+      let base;
+      let basisUsed = basis;
+      let through;
+      if (basis === 'ttm' && dp.ttm) { base = dp.ttm.dividendPerShare; through = dp.ttm.through; }
+      else if (basis === 'avg3') { base = dp.avg3; through = dp.latestFy.periodEnd; basisUsed = 'avg3'; }
+      else { base = dp.latestFy.dividendPerShare; basisUsed = 'lastFy'; through = dp.latestFy.periodEnd; }
+      if (basis === 'ttm' && !dp.ttm) { base = dp.latestFy.dividendPerShare; basisUsed = 'lastFy'; through = dp.latestFy.periodEnd; }
+
+      if (!(base > 0)) return null;
+      sources.dividendPerShare = dp.tag;
+
+      return {
+        model: 'dividend-discount',
+        because,
+        history: dp.history,
+        base,
+        basisUsed,
+        through,
+        netDebt: 0,
+        shares: 1,
+        latestPeriodEnd: dp.latestFy.periodEnd,
+        alternativeBases: {
+          ttm: dp.ttm?.dividendPerShare ?? null,
+          lastFy: dp.latestFy.dividendPerShare,
+          avg3: dp.avg3,
+        },
+      };
+    };
+
+    let plan = null;
+
     if (!capexRef) {
-      return res.status(422).json({
-        error: `${entity.name} does not report capital expenditure under any standard tag.`,
-        detail:
-          'Banks and insurers do not report capital expenditure at all, and a free-cash-flow DCF is not a valid model for them — a dividend discount or residual income model is. Some capital-intensive filers, utilities in particular, do spend heavily but tag it in their own company namespace rather than a standard one, in which case the spending exists but cannot be read from these filings.',
-        ticker: ticker.toUpperCase(),
-        company: entity.name,
-      });
+      plan = buildDividendModel(`${entity.name} reports no capital expenditure, so free cash flow cannot be built from its filings.`);
+      if (!plan) {
+        return res.status(422).json({
+          error: `${entity.name} reports neither capital expenditure nor dividends per share.`,
+          detail:
+            'Free cash flow cannot be built without capital expenditure, and the dividend discount model that would normally cover such a filer needs a dividend history this one does not report.',
+          ticker: ticker.toUpperCase(),
+          company: entity.name,
+        });
+      }
     }
 
-    if (!ocfAnnual.length || !capexAnnual.length) {
+    if (substituted) {
+      warnings.push(
+        `${ticker.toUpperCase()} maps to ${substituted.from}, which has no 10-K history. Figures are taken from ${substituted.to} (CIK ${substituted.cik}), the registrant holding the filings.`
+      );
+    }
+
+    if (!plan && (!ocfAnnual.length || !capexAnnual.length)) {
       return res.status(422).json({
         error: `No annual (10-K) cash flow history found for ${entity.name}.`,
         detail:
@@ -341,77 +429,101 @@ export default async function handler(req, res) {
       });
     }
 
-    if (substituted) {
+    if (!plan) {
+      // Pair the two series by fiscal period end so a missing year can't misalign them.
+      const capexByEnd = new Map(capexAnnual.map((e) => [e.end, e]));
+      const history = ocfAnnual
+        .filter((o) => capexByEnd.has(o.end))
+        .map((o) => {
+          const c = capexByEnd.get(o.end);
+          const capex = Math.abs(c.val);
+          return { periodEnd: o.end, operatingCashFlow: o.val, capex, freeCashFlow: o.val - capex, capexTag: c.tag };
+        });
+
+      if (!history.length) return res.status(422).json({ error: 'Could not align cash flow and capex periods.' });
+
+      const latestFy = history[history.length - 1];
+      const latestOcfYear = +ocfAnnual[ocfAnnual.length - 1].end.slice(0, 4);
+      const capexLagYears = latestOcfYear - +latestFy.periodEnd.slice(0, 4);
+
+      // A filer can keep reporting cash flow long after it stops tagging capex —
+      // Prologis dropped PaymentsForCapitalImprovements after 2018. Valuing recent
+      // cash against decade-old investment spend would be worse than not answering,
+      // so fall through to dividends, which such filers do still report.
+      if (capexLagYears >= 2) {
+        plan = buildDividendModel(
+          `${entity.name} last reported capital expenditure for ${latestFy.periodEnd.slice(0, 4)} but has cash flow through ${latestOcfYear}, so recent free cash flow cannot be built.`
+        );
+        if (!plan) {
+          return res.status(422).json({
+            error: `${entity.name} last reported capital expenditure for ${latestFy.periodEnd.slice(0, 4)}, but has cash flow through ${latestOcfYear}.`,
+            detail:
+              'Free cash flow cannot be built for recent periods, so any valuation would mix stale investment spend with a current balance sheet. This filer reports no dividend history either, so the model that would normally cover it is unavailable.',
+            ticker: ticker.toUpperCase(),
+            company: entity.name,
+            history,
+          });
+        }
+      } else {
+        sources.operatingCashFlow = ocfAnnual[ocfAnnual.length - 1].tag;
+        sources.capex = latestFy.capexTag;
+
+        if (!STANDARD_CAPEX.has(latestFy.capexTag)) {
+          warnings.push(
+            `Capex read from the narrower tag "${latestFy.capexTag}" — this filer does not report a standard capital expenditure line, so free cash flow may be overstated.`
+          );
+        }
+
+        // Anchor both trailing calculations to the same fiscal period, or a filer whose
+        // two series end in different years would produce a spliced, meaningless TTM.
+        const ocfAnchor = ocfAnnual.find((e) => e.end === latestFy.periodEnd);
+        const capexAnchor = capexAnnual.find((e) => e.end === latestFy.periodEnd);
+        const ocfTtm = trailingTwelveMonths(ocfRef.entries, ocfAnchor);
+        const capexTtm = trailingTwelveMonths(capexRef.entries, capexAnchor);
+        const ttm =
+          ocfTtm && capexTtm && ocfTtm.through === capexTtm.through
+            ? { freeCashFlow: ocfTtm.val - Math.abs(capexTtm.val), through: ocfTtm.through }
+            : null;
+
+        const avg3 = history.slice(-3).reduce((s, h) => s + h.freeCashFlow, 0) / Math.min(3, history.length);
+
+        let base;
+        let basisUsed = basis;
+        let through;
+        if (basis === 'ttm' && ttm) { base = ttm.freeCashFlow; through = ttm.through; }
+        else if (basis === 'avg3') { base = avg3; through = latestFy.periodEnd; }
+        else {
+          base = latestFy.freeCashFlow;
+          basisUsed = 'lastFy';
+          through = latestFy.periodEnd;
+          if (basis === 'ttm') warnings.push('Interim filings were insufficient to build a trailing-twelve-month figure; fell back to the last full fiscal year.');
+        }
+
+        plan = {
+          model: 'free-cash-flow',
+          history,
+          base,
+          basisUsed,
+          through,
+          latestPeriodEnd: latestFy.periodEnd,
+          alternativeBases: { ttm: ttm?.freeCashFlow ?? null, lastFy: latestFy.freeCashFlow, avg3 },
+        };
+      }
+    }
+
+    if (plan.history.length < 3) {
+      warnings.push(`Only ${plan.history.length} year(s) of filing history available — growth assumptions have little to anchor to.`);
+    }
+
+    const monthsStale = (Date.now() - Date.parse(plan.latestPeriodEnd)) / (30 * DAY);
+    if (plan.basisUsed === 'lastFy' && monthsStale > 9) {
+      warnings.push(`Last fiscal year ended ${plan.latestPeriodEnd}, roughly ${Math.round(monthsStale)} months ago.`);
+    }
+
+    if (plan.model === 'dividend-discount') {
       warnings.push(
-        `${ticker.toUpperCase()} maps to ${substituted.from}, which has no 10-K history. Figures are taken from ${substituted.to} (CIK ${substituted.cik}), the registrant holding the filings.`
+        `${plan.because} Valued instead on its dividend stream, which counts only cash actually paid out — a filer returning capital through buybacks will look cheaper on this basis than it is.`
       );
-    }
-
-    // Pair the two series by fiscal period end so a missing year can't misalign them.
-    const capexByEnd = new Map(capexAnnual.map((e) => [e.end, e]));
-    const history = ocfAnnual
-      .filter((o) => capexByEnd.has(o.end))
-      .map((o) => {
-        const c = capexByEnd.get(o.end);
-        const capex = Math.abs(c.val);
-        return { periodEnd: o.end, operatingCashFlow: o.val, capex, freeCashFlow: o.val - capex, capexTag: c.tag };
-      });
-
-    if (!history.length) return res.status(422).json({ error: 'Could not align cash flow and capex periods.' });
-    if (history.length < 3) warnings.push(`Only ${history.length} year(s) of filing history available — growth assumptions have little to anchor to.`);
-
-    const latestFy = history[history.length - 1];
-    sources.operatingCashFlow = ocfAnnual[ocfAnnual.length - 1].tag;
-    sources.capex = latestFy.capexTag;
-
-    // A filer can keep reporting cash flow long after it stops tagging capex —
-    // Prologis dropped PaymentsForCapitalImprovements after 2018. Valuing recent
-    // cash against decade-old investment spend would be worse than not answering.
-    const latestOcfYear = +ocfAnnual[ocfAnnual.length - 1].end.slice(0, 4);
-    const capexLagYears = latestOcfYear - +latestFy.periodEnd.slice(0, 4);
-    if (capexLagYears >= 2) {
-      return res.status(422).json({
-        error: `${entity.name} last reported capital expenditure for ${latestFy.periodEnd.slice(0, 4)}, but has cash flow through ${latestOcfYear}.`,
-        detail:
-          'Free cash flow cannot be built for recent periods, so any valuation would mix stale investment spend with a current balance sheet. This is common for REITs, which tag property acquisitions rather than maintenance capex.',
-        ticker: ticker.toUpperCase(),
-        company: entity.name,
-        history,
-      });
-    }
-
-    if (!STANDARD_CAPEX.has(latestFy.capexTag)) {
-      warnings.push(
-        `Capex read from the narrower tag "${latestFy.capexTag}" — this filer does not report a standard capital expenditure line, so free cash flow may be overstated.`
-      );
-    }
-
-    // Anchor both trailing calculations to the same fiscal period, or a filer whose
-    // two series end in different years would produce a spliced, meaningless TTM.
-    const ocfAnchor = ocfAnnual.find((e) => e.end === latestFy.periodEnd);
-    const capexAnchor = capexAnnual.find((e) => e.end === latestFy.periodEnd);
-    const ocfTtm = trailingTwelveMonths(ocfRef.entries, ocfAnchor);
-    const capexTtm = trailingTwelveMonths(capexRef.entries, capexAnchor);
-    const ttm =
-      ocfTtm && capexTtm && ocfTtm.through === capexTtm.through
-        ? { freeCashFlow: ocfTtm.val - Math.abs(capexTtm.val), through: ocfTtm.through }
-        : null;
-
-    const avg3 = history.slice(-3).reduce((s, h) => s + h.freeCashFlow, 0) / Math.min(3, history.length);
-
-    let baseFcf;
-    let basisUsed = basis;
-    if (basis === 'ttm' && ttm) baseFcf = ttm.freeCashFlow;
-    else if (basis === 'avg3') baseFcf = avg3;
-    else {
-      baseFcf = latestFy.freeCashFlow;
-      basisUsed = 'lastFy';
-      if (basis === 'ttm') warnings.push('Interim filings were insufficient to build a trailing-twelve-month figure; fell back to the last full fiscal year.');
-    }
-
-    const monthsStale = (Date.now() - Date.parse(latestFy.periodEnd)) / (30 * DAY);
-    if (basisUsed === 'lastFy' && monthsStale > 9) {
-      warnings.push(`Last fiscal year ended ${latestFy.periodEnd}, roughly ${Math.round(monthsStale)} months ago.`);
     }
 
     const cashRef = resolve(facts, TAGS.cash, 'USD');
@@ -443,28 +555,59 @@ export default async function handler(req, res) {
     const diluted = dilRef ? annualSeries(dilRef.entries).slice(-1)[0] ?? latestInstant(dilRef.entries) : null;
     const cover = coverRef ? latestInstant(coverRef.entries) : null;
     const shares = diluted?.val ?? cover?.val;
-    if (!shares) return res.status(422).json({ error: 'No share count reported in EDGAR for this filer.' });
-    sources.shares = diluted?.tag ?? cover?.tag;
+    if (!shares && plan.model === 'free-cash-flow') {
+      return res.status(422).json({ error: 'No share count reported in EDGAR for this filer.' });
+    }
+    sources.shares = diluted?.tag ?? cover?.tag ?? null;
 
-    if (baseFcf <= 0) {
-      return res.status(422).json({
-        error: `${entity.name} has negative free cash flow on the selected basis — a DCF cannot produce a meaningful value.`,
-        baseFreeCashFlow: baseFcf,
-        ticker: ticker.toUpperCase(),
-        company: entity.name,
-        history,
-      });
+    // The cash flow model values the whole business, so it needs the net debt bridge
+    // and a share count. Dividends per share are already per-share and already net of
+    // everything the company owes, so that model takes neither.
+    if (plan.model === 'free-cash-flow') {
+      plan.netDebt = netDebt;
+      plan.shares = shares;
+    }
+
+    if (plan.base <= 0) {
+      // A cash flow model can fall back to dividends here, but a dividend model has
+      // nowhere left to go.
+      if (plan.model === 'free-cash-flow') {
+        const fallback = buildDividendModel(
+          `${entity.name} has negative free cash flow on the selected basis, so a cash flow valuation cannot produce a meaningful figure.`
+        );
+        if (fallback) {
+          fallback.netDebt = 0;
+          fallback.shares = 1;
+          warnings.push(
+            `${fallback.because} Valued instead on its dividend stream, which counts only cash actually paid out.`
+          );
+          plan = fallback;
+        }
+      }
+      if (plan.base <= 0) {
+        return res.status(422).json({
+          error:
+            plan.model === 'free-cash-flow'
+              ? `${entity.name} has negative free cash flow on the selected basis, and reports no dividends to value instead.`
+              : `${entity.name} pays no dividend, so there is no stream to discount.`,
+          baseValue: plan.base,
+          ticker: ticker.toUpperCase(),
+          company: entity.name,
+          history: plan.history,
+        });
+      }
     }
 
     const quote = await spotPrice(ticker);
+    const { base: baseValue, netDebt: modelNetDebt, shares: modelShares } = plan;
 
     const base = valueFrom(
-      baseFcf,
+      baseValue,
       growthPath(initialGrowth, terminalGrowth, years),
       wacc,
       terminalGrowth,
-      netDebt,
-      shares
+      modelNetDebt,
+      modelShares
     );
 
     // Sensitivity: the point estimate is far less informative than the spread.
@@ -474,7 +617,7 @@ export default async function handler(req, res) {
       tgAxis.map((g) =>
         w <= g
           ? null
-          : +valueFrom(baseFcf, growthPath(initialGrowth, g, years), w, g, netDebt, shares).perShare.toFixed(2)
+          : +valueFrom(baseValue, growthPath(initialGrowth, g, years), w, g, modelNetDebt, modelShares).perShare.toFixed(2)
       )
     );
 
@@ -494,7 +637,10 @@ export default async function handler(req, res) {
     }
 
     const implied =
-      price !== null ? impliedGrowth(price, baseFcf, terminalGrowth, years, wacc, netDebt, shares) : null;
+      price !== null ? impliedGrowth(price, baseValue, terminalGrowth, years, wacc, modelNetDebt, modelShares) : null;
+
+    const isDividendModel = plan.model === 'dividend-discount';
+    const streamName = isDividendModel ? 'dividends per share' : 'free cash flow';
 
     res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate=86400');
     return res.status(200).json({
@@ -502,31 +648,41 @@ export default async function handler(req, res) {
       company: entity.name,
       cik: entity.cik,
       quote,
+      model: {
+        kind: plan.model,
+        label: isDividendModel ? 'Dividend discount' : 'Discounted free cash flow',
+        stream: streamName,
+        // Present when the cash flow model could not be built, explaining what
+        // forced the switch rather than leaving the reader to infer it.
+        because: plan.because ?? null,
+      },
       assumptions: {
         wacc,
         terminalGrowth,
         initialGrowth,
         years,
-        basis: basisUsed,
-        baseFreeCashFlow: baseFcf,
-        baseFreeCashFlowThrough: basisUsed === 'ttm' ? ttm?.through : latestFy.periodEnd,
+        basis: plan.basisUsed,
+        baseValue: plan.base,
+        // Kept under its original name so existing consumers keep working; for the
+        // dividend model it carries a per-share dividend, not a cash flow.
+        baseFreeCashFlow: plan.base,
+        baseFreeCashFlowThrough: plan.through,
       },
       inputs: {
-        shares,
+        shares: shares ?? null,
         dilutedShares: diluted?.val ?? null,
         coverPageShares: cover?.val ?? null,
         cash: cash?.val ?? 0,
         shortTermInvestments: sti?.val ?? 0,
         totalDebt,
         netDebt,
+        // The dividend model discounts a per-share stream, so neither figure above
+        // enters the valuation; both are reported for context only.
+        usedInValuation: !isDividendModel,
         asOf: cash?.end ?? null,
       },
-      history,
-      alternativeBases: {
-        ttm: ttm?.freeCashFlow ?? null,
-        lastFy: latestFy.freeCashFlow,
-        avg3,
-      },
+      history: plan.history,
+      alternativeBases: plan.alternativeBases,
       valuation: {
         perShare: +base.perShare.toFixed(2),
         enterpriseValue: base.enterpriseValue,
@@ -537,8 +693,9 @@ export default async function handler(req, res) {
         projection: base.rows.map((r) => ({
           year: r.year,
           growth: +r.growth.toFixed(4),
-          freeCashFlow: Math.round(r.fcf),
-          presentValue: Math.round(r.pv),
+          value: isDividendModel ? +r.fcf.toFixed(4) : Math.round(r.fcf),
+          freeCashFlow: isDividendModel ? null : Math.round(r.fcf),
+          presentValue: isDividendModel ? +r.pv.toFixed(4) : Math.round(r.pv),
         })),
       },
       verdict: { rating: verdict, upside: upside === null ? null : +upside.toFixed(4) },
@@ -547,7 +704,7 @@ export default async function handler(req, res) {
         note:
           implied === null
             ? 'Current price is outside the range solvable with these assumptions.'
-            : `At a ${(wacc * 100).toFixed(1)}% discount rate, today's price implies free cash flow growing ${(implied * 100).toFixed(1)}% initially, fading to ${(terminalGrowth * 100).toFixed(1)}% over ${years} years.`,
+            : `At a ${(wacc * 100).toFixed(1)}% discount rate, today's price implies ${streamName} growing ${(implied * 100).toFixed(1)}% initially, fading to ${(terminalGrowth * 100).toFixed(1)}% over ${years} years.`,
       },
       sensitivity: { waccAxis, terminalGrowthAxis: tgAxis, grid },
       sources,
