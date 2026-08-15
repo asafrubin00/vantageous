@@ -1451,6 +1451,194 @@ function WatchlistPanel({ tickers, assumptions, onSelect, onRemove, heading = 'W
   );
 }
 
+// ── Fundamentals: multiples and business metrics ──────────────────────────────
+//
+// Shown for every company, including those the valuation refuses. A DCF declining
+// Amazon is correct but unhelpful; every company has revenue, earnings and a balance
+// sheet, so every company can at least be placed on a multiple and read for why it
+// looks the way it does.
+function useFundamentals(ticker) {
+  const [state, setState] = useState({ status: 'idle' });
+
+  useEffect(() => {
+    if (!ticker) { setState({ status: 'idle' }); return; }
+    let cancelled = false;
+    setState({ status: 'loading' });
+    fetch(`/api/fundamentals?ticker=${encodeURIComponent(ticker)}`)
+      .then((r) => r.json().then((body) => ({ ok: r.ok, body })))
+      .then(({ ok, body }) => { if (!cancelled) setState(ok ? { status: 'ok', data: body } : { status: 'error', error: body }); })
+      .catch((err) => { if (!cancelled) setState({ status: 'error', error: { error: err.message } }); });
+    return () => { cancelled = true; };
+  }, [ticker]);
+
+  return state;
+}
+
+function Metric({ label, value, hint }) {
+  return (
+    <div className="bg-dark/40 border border-dark-border/60 rounded p-2.5">
+      <p className="text-[10px] text-gray-500 mb-1 leading-tight">{label}</p>
+      <p className="text-sm text-gray-100 font-mono">{value ?? '—'}</p>
+      {hint && <p className="text-[9px] text-gray-600 mt-0.5 leading-tight">{hint}</p>}
+    </div>
+  );
+}
+
+function FundamentalsPanel({ ticker }) {
+  const state = useFundamentals(ticker);
+  if (state.status === 'loading') {
+    return <div className="bg-dark-card border border-dark-border rounded-lg p-4 text-[11px] text-gray-600">Reading filings…</div>;
+  }
+  if (state.status !== 'ok') {
+    return state.status === 'error' ? (
+      <div className="bg-dark-card border border-dark-border rounded-lg p-4">
+        <p className="text-[11px] text-gray-500">{state.error?.error ?? 'No fundamentals available.'}</p>
+      </div>
+    ) : null;
+  }
+
+  const { multiples: m, trends: t, annual } = state.data;
+  const x = (v) => (v === null || v === undefined ? null : `${v}×`);
+  const p = (v) => (v === null || v === undefined ? null : `${v > 0 ? '+' : ''}${(v * 100).toFixed(1)}%`);
+  const tone = (v) => (v === null || v === undefined ? 'text-gray-100' : v > 0 ? 'text-emerald-400' : 'text-red-400');
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-dark-card border border-dark-border rounded-lg p-4">
+        <h3 className="text-sm text-gray-200 mb-1">What the market pays</h3>
+        <p className="text-[11px] text-gray-600 mb-3 leading-relaxed">
+          The same multiples for every company, so two can be compared directly. A blank means
+          the measure does not apply — banks have no meaningful EBITDA, and a loss-making
+          company has no price-to-earnings.
+        </p>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          <Metric label="Price / earnings" value={x(m.priceEarnings)} />
+          <Metric label="Price / sales" value={x(m.priceSales)} />
+          <Metric label="Price / book" value={x(m.priceBook)} />
+          <Metric label="EV / sales" value={x(m.evSales)} />
+          <Metric label="EV / EBITDA" value={x(m.evEbitda)} />
+          <Metric label="Market value" value={state.data.marketCap ? fmtMoney(state.data.marketCap) : null} />
+        </div>
+      </div>
+
+      <div className="bg-dark-card border border-dark-border rounded-lg p-4">
+        <h3 className="text-sm text-gray-200 mb-1">How the business is doing</h3>
+        <p className="text-[11px] text-gray-600 mb-3 leading-relaxed">
+          A multiple says what it costs. These say whether it is earning it.
+        </p>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          <Metric label="Revenue growth" value={p(t.revenueGrowthYoY)} hint="latest year" />
+          <Metric label="Revenue growth" value={p(t.revenueCagr3y)} hint="3yr annualised" />
+          <Metric label="Gross margin" value={p(t.grossMargin)} />
+          <Metric label="Operating margin" value={p(t.operatingMargin)} hint={t.operatingMarginChange3y !== null ? `${p(t.operatingMarginChange3y)} over 3yr` : undefined} />
+          <Metric label="Net margin" value={p(t.netMargin)} />
+          <Metric label="Return on equity" value={p(t.returnOnEquity)} />
+          <Metric label="Net debt / EBITDA" value={t.netDebtToEbitda === null ? null : `${t.netDebtToEbitda}×`} hint="lower is safer" />
+        </div>
+
+        {annual.length > 1 && (
+          <div className="mt-4 pt-3 border-t border-dark-border/40">
+            <p className="text-[10px] text-gray-500 mb-2">Revenue and operating margin by year</p>
+            <div className="overflow-x-auto scrollbar-none">
+              <table className="w-full min-w-[360px] text-[11px]">
+                <tbody>
+                  <tr className="text-gray-600">
+                    <td className="p-1">Year</td>
+                    {annual.slice(-6).map((a) => <td key={a.periodEnd} className="p-1 text-right font-mono">{a.periodEnd.slice(2, 4)}</td>)}
+                  </tr>
+                  <tr className="border-t border-dark-border/40">
+                    <td className="p-1 text-gray-500">Revenue</td>
+                    {annual.slice(-6).map((a) => <td key={a.periodEnd} className="p-1 text-right font-mono text-gray-300">{fmtMoney(a.revenue)}</td>)}
+                  </tr>
+                  <tr className="border-t border-dark-border/40">
+                    <td className="p-1 text-gray-500">Op margin</td>
+                    {annual.slice(-6).map((a) => (
+                      <td key={a.periodEnd} className={`p-1 text-right font-mono ${a.operatingMargin === null ? 'text-gray-700' : tone(a.operatingMargin)}`}>
+                        {a.operatingMargin === null ? '—' : `${(a.operatingMargin * 100).toFixed(0)}%`}
+                      </td>
+                    ))}
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Valuation history chart ───────────────────────────────────────────────────
+//
+// The change column reduces a week to a single number. Plotting price against fair
+// value shows whether something is drifting cheaper steadily or simply bounced once.
+function HistoryChart({ ticker, assumptions }) {
+  const [rows, setRows] = useState(null);
+  const fingerprint = assumptionFingerprint(assumptions);
+
+  useEffect(() => {
+    if (!ticker) return;
+    let cancelled = false;
+    fetch(`/api/history?tickers=${encodeURIComponent(ticker)}&fingerprint=${encodeURIComponent(fingerprint)}`)
+      .then((r) => r.json())
+      .then((j) => { if (!cancelled) setRows(j?.snapshots?.[ticker] ?? []); })
+      .catch(() => { if (!cancelled) setRows([]); });
+    return () => { cancelled = true; };
+  }, [ticker, fingerprint]);
+
+  if (!rows || rows.length < 2) return null;
+
+  const W = 520;
+  const H = 130;
+  const PAD = { l: 6, r: 6, t: 10, b: 16 };
+  const values = rows.flatMap((r) => [r.p, r.f]);
+  const lo = Math.min(...values);
+  const hi = Math.max(...values);
+  const span = hi - lo || 1;
+  const xAt = (i) => PAD.l + (i / Math.max(1, rows.length - 1)) * (W - PAD.l - PAD.r);
+  const yAt = (v) => PAD.t + (1 - (v - lo) / span) * (H - PAD.t - PAD.b);
+  const path = (key) => rows.map((r, i) => `${i ? 'L' : 'M'}${xAt(i).toFixed(1)},${yAt(r[key]).toFixed(1)}`).join(' ');
+
+  const first = rows[0];
+  const last = rows.at(-1);
+  const gapNow = last.f / last.p - 1;
+  const gapThen = first.f / first.p - 1;
+
+  return (
+    <div className="bg-dark-card border border-dark-border rounded-lg p-4">
+      <div className="flex items-baseline justify-between gap-3 mb-1 flex-wrap">
+        <h3 className="text-sm text-gray-200">Price against fair value</h3>
+        <span className="text-[10px] text-gray-600">{rows.length} days recorded</span>
+      </div>
+      <p className="text-[11px] text-gray-600 mb-3 leading-relaxed">
+        Both lines under your current assumptions. The gap between them is the upside.
+      </p>
+
+      <div className="overflow-x-auto scrollbar-none">
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full min-w-[320px]" style={{ height: H }} role="img"
+             aria-label={`Price and fair value over ${rows.length} days`}>
+          <path d={`${path('f')} L${xAt(rows.length - 1)},${yAt(lo)} L${xAt(0)},${yAt(lo)} Z`} fill="rgba(252,210,153,0.07)" />
+          <path d={path('p')} fill="none" stroke="#9ca3af" strokeWidth="1.5" strokeLinejoin="round" />
+          <path d={path('f')} fill="none" stroke="#FCD299" strokeWidth="1.75" strokeLinejoin="round" />
+          {rows.map((r, i) => (
+            <circle key={r.d} cx={xAt(i)} cy={yAt(r.f)} r="1.8" fill="#FCD299" />
+          ))}
+          <text x={PAD.l} y={H - 4} className="fill-gray-600" style={{ fontSize: 9 }}>{first.d.slice(5)}</text>
+          <text x={W - PAD.r} y={H - 4} textAnchor="end" className="fill-gray-600" style={{ fontSize: 9 }}>{last.d.slice(5)}</text>
+        </svg>
+      </div>
+
+      <div className="flex items-center gap-4 mt-2 flex-wrap text-[10px]">
+        <span className="flex items-center gap-1.5 text-gray-500"><span className="w-3 h-px bg-salmon inline-block" /> fair value</span>
+        <span className="flex items-center gap-1.5 text-gray-500"><span className="w-3 h-px bg-gray-400 inline-block" /> price</span>
+        <span className="ml-auto text-gray-600">
+          gap {fmtPct(gapThen)} → <span className={gapNow > gapThen ? 'text-emerald-400' : gapNow < gapThen ? 'text-red-400' : ''}>{fmtPct(gapNow)}</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
 // The active ticker lives in App so the signals feed can set it. This view stays
 // mounted across tab switches, so assumptions and results survive a trip to
 // Signals and back rather than resetting and refetching.
@@ -1600,15 +1788,23 @@ function ValuationView({ ticker, onTicker }) {
             )}
 
             {error && (
-              <div className="bg-dark-card border border-red-500/30 rounded-lg p-4">
-                <p className="text-red-400 text-sm mb-1">{error.error}</p>
-                {error.detail && <p className="text-gray-500 text-[11px] leading-relaxed">{error.detail}</p>}
-                {error.history?.length > 0 && (
-                  <p className="text-gray-600 text-[11px] mt-2">
-                    Last free cash flow on record: {fmtMoney(error.history.at(-1).freeCashFlow)} for{' '}
-                    {error.history.at(-1).periodEnd}.
+              <div className="space-y-4">
+                <div className="bg-dark-card border border-red-500/30 rounded-lg p-4">
+                  <p className="text-red-400 text-sm mb-1">{error.error}</p>
+                  {error.detail && <p className="text-gray-500 text-[11px] leading-relaxed">{error.detail}</p>}
+                  {error.history?.length > 0 && (
+                    <p className="text-gray-600 text-[11px] mt-2">
+                      Last free cash flow on record: {fmtMoney(error.history.at(-1).freeCashFlow)} for{' '}
+                      {error.history.at(-1).periodEnd}.
+                    </p>
+                  )}
+                  <p className="text-gray-600 text-[11px] mt-2 leading-relaxed">
+                    A valuation is not possible here, but the filings still describe the business —
+                    the figures below come from them.
                   </p>
-                )}
+                </div>
+                {/* The whole point: a refused valuation should not leave the reader with nothing. */}
+                <FundamentalsPanel ticker={ticker} />
               </div>
             )}
 
@@ -1665,6 +1861,8 @@ function ValuationView({ ticker, onTicker }) {
                     </div>
                   )}
 
+                  <HistoryChart ticker={data.ticker} assumptions={assumptions} />
+                  <FundamentalsPanel ticker={data.ticker} />
                   <SensitivityGrid sensitivity={data.sensitivity} price={data.quote?.price} />
                   {data.history.length > 1 && <HistoryStrip history={data.history} dividend={isDividendModel(data)} />}
                   <Provenance data={data} />

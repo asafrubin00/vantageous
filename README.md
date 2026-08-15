@@ -92,6 +92,32 @@ says so rather than quietly reporting another company's figures. Separately, cap
 tagging varies enough that a single missing tag can cost a whole sector: Verizon reports
 under `PaymentsToAcquireOtherProductiveAssets`, one word from a tag already in the chain.
 
+### Multiples and business metrics
+
+`/api/fundamentals` is deliberately independent of the valuation. A discounted cash flow
+legitimately refuses plenty of companies — Amazon has negative free cash flow and pays no
+dividend — and "no answer" is a poor result for one of the largest companies in the
+market. Every company has revenue, earnings and a balance sheet, so every company is
+placed on the same multiples: price to earnings, sales and book, EV to sales and EBITDA.
+Because they are the same measures for everyone, two companies can be compared directly
+rather than each being described in its own terms.
+
+The same extraction answers the question a valuation alone cannot — not whether something
+looks cheap, but why. Revenue growth year on year and over three years, gross, operating
+and net margin, the three-year change in operating margin, return on equity, and net debt
+to EBITDA, with revenue and operating margin shown by year.
+
+A blank means the measure does not apply rather than that it failed: banks have no
+meaningful EBITDA, and a loss-making company has no price-to-earnings. Where the valuation
+refuses, these figures are shown anyway, so a refusal never leaves the reader with nothing.
+
+### Valuation history chart
+
+Price and fair value plotted together over the recorded history, both under the current
+assumptions, so the gap between them can be read as a trend rather than the single number
+the change column gives. Fair value moves only when new filings land, so most of the
+movement is price — which is the point, since the gap is what changes.
+
 ### Watchlist
 
 Starring a ticker keeps it on a watchlist, which becomes the landing surface of the

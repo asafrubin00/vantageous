@@ -11,7 +11,7 @@ const DAY = 86400_000;
 // under the multijurisdictional system file 40-F. Treating 10-K as the only annual
 // report silently excluded Shell, BP, PDD, Agnico Eagle and every other cross-listed
 // company — they were reported as having no filing history at all.
-const ANNUAL_FORMS = /^(10-K|20-F|40-F)(\/A)?$/;
+export const ANNUAL_FORMS = /^(10-K|20-F|40-F)(\/A)?$/;
 
 // Foreign issuers also report under the IFRS taxonomy rather than us-gaap, so the
 // namespace has to be searched alongside it or their filings look empty.
@@ -19,7 +19,7 @@ const NAMESPACES = ['us-gaap', 'ifrs-full', 'dei'];
 
 // Tag fallback chains, in priority order. First hit wins — these are alternatives
 // for the same line item, not components to be summed.
-const TAGS = {
+export const TAGS = {
   ocf: [
     'NetCashProvidedByUsedInOperatingActivities',
     'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
@@ -98,7 +98,7 @@ const STANDARD_CAPEX = new Set([
 
 let tickerMapCache = null;
 
-async function tickerToCik(ticker) {
+export async function tickerToCik(ticker) {
   if (!tickerMapCache) {
     const r = await fetch('https://www.sec.gov/files/company_tickers.json', {
       headers: { 'User-Agent': UA },
@@ -156,7 +156,7 @@ async function findFilingEntity(name, excludeCik) {
   return null;
 }
 
-async function companyFacts(cik) {
+export async function companyFacts(cik) {
   const padded = String(cik).padStart(10, '0');
   const r = await fetch(`https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`, {
     headers: { 'User-Agent': UA },
@@ -170,7 +170,7 @@ async function companyFacts(cik) {
 // PaymentsToAcquireProductiveAssets from 2022. Taking only the first tag that
 // exists would silently truncate the series to a dead decade, so merge every tag
 // in the chain and let priority settle the periods where they overlap.
-function resolve(facts, chain, unit) {
+export function resolve(facts, chain, unit) {
   const entries = [];
   chain.forEach((tag, prio) => {
     for (const ns of NAMESPACES) {
@@ -210,7 +210,7 @@ function dedupeByPeriod(entries, keyFn, pick = better) {
   return [...best.values()];
 }
 
-function annualSeries(entries, pick = better) {
+export function annualSeries(entries, pick = better) {
   const annual = entries.filter((e) => {
     if (!ANNUAL_FORMS.test(e.form ?? '') || !e.start) return false;
     const days = (Date.parse(e.end) - Date.parse(e.start)) / DAY;
@@ -246,7 +246,7 @@ function trailingTwelveMonths(entries, latestAnnual, pick = better) {
   return { val: latestAnnual.val + ytd.val - prior.val, through: ytd.end, ytdSpanDays: Math.round(span / DAY) };
 }
 
-function latestInstant(entries) {
+export function latestInstant(entries) {
   const instants = dedupeByPeriod(entries.filter((e) => !e.start), (e) => e.end);
   if (!instants.length) return null;
   return instants.sort((a, b) => b.end.localeCompare(a.end))[0];
@@ -307,7 +307,7 @@ function dividendPlan(facts) {
   return { history, latestFy, ttm, avg3, derived, tag: annual[annual.length - 1].tag };
 }
 
-async function spotPrice(ticker) {
+export async function spotPrice(ticker) {
   const r = await fetch(
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1d`,
     { headers: { 'User-Agent': 'Mozilla/5.0' } }
