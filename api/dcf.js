@@ -7,12 +7,24 @@
 const UA = 'Vantageous DCF (rubin.asaf01@gmail.com)';
 const DAY = 86400_000;
 
+// US domestic filers use 10-K, but foreign issuers file 20-F and Canadian companies
+// under the multijurisdictional system file 40-F. Treating 10-K as the only annual
+// report silently excluded Shell, BP, PDD, Agnico Eagle and every other cross-listed
+// company — they were reported as having no filing history at all.
+const ANNUAL_FORMS = /^(10-K|20-F|40-F)(\/A)?$/;
+
+// Foreign issuers also report under the IFRS taxonomy rather than us-gaap, so the
+// namespace has to be searched alongside it or their filings look empty.
+const NAMESPACES = ['us-gaap', 'ifrs-full', 'dei'];
+
 // Tag fallback chains, in priority order. First hit wins — these are alternatives
 // for the same line item, not components to be summed.
 const TAGS = {
   ocf: [
     'NetCashProvidedByUsedInOperatingActivities',
     'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
+    // IFRS
+    'CashFlowsFromUsedInOperatingActivities',
   ],
   capex: [
     'PaymentsToAcquirePropertyPlantAndEquipment',
@@ -22,10 +34,16 @@ const TAGS = {
     'PaymentsToAcquireOtherProductiveAssets',
     'PaymentsForCapitalImprovements',
     'PaymentsToAcquireOtherPropertyPlantAndEquipment',
+    // IFRS. BP reports the long combined form; Agnico Eagle uses the additions tag.
+    'PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
+    'PurchaseOfPropertyPlantAndEquipmentIntangibleAssetsOtherThanGoodwillInvestmentPropertyAndOtherNoncurrentAssets',
+    'AdditionsOtherThanThroughBusinessCombinationsPropertyPlantAndEquipment',
   ],
   cash: [
     'CashAndCashEquivalentsAtCarryingValue',
     'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents',
+    // IFRS
+    'CashAndCashEquivalents',
   ],
   shortTermInvestments: [
     'ShortTermInvestments',
@@ -37,8 +55,15 @@ const TAGS = {
     'LongTermDebtNoncurrent',
     'LongTermDebtAndCapitalLeaseObligations',
     'LongTermDebt',
+    // IFRS
+    'LongtermBorrowings',
+    'Borrowings',
   ],
-  shortTermDebt: ['LongTermDebtCurrent', 'DebtCurrent', 'ShortTermBorrowings'],
+  shortTermDebt: [
+    'LongTermDebtCurrent', 'DebtCurrent', 'ShortTermBorrowings',
+    // IFRS
+    'CurrentPortionOfLongtermBorrowings', 'ShorttermBorrowings',
+  ],
   dilutedShares: ['WeightedAverageNumberOfDilutedSharesOutstanding'],
   coverShares: ['EntityCommonStockSharesOutstanding'],
   // Banks, insurers and REITs report no usable capital expenditure, so free cash
@@ -47,7 +72,16 @@ const TAGS = {
   dividendPerShare: [
     'CommonStockDividendsPerShareDeclared',
     'CommonStockDividendsPerShareCashPaid',
+    // Business development companies and closed-end funds distribute rather than pay
+    // a dividend, and tag it accordingly — Trinity Capital reports $2.04 a share here.
+    'InvestmentCompanyDistributionToShareholdersPerShare',
+    // IFRS
+    'DividendsPaidOrdinarySharesPerShare',
   ],
+  // Some filers report only a total dividend outflow and no per-share figure at all.
+  // Citigroup pays $5.4bn without tagging a per-share number anywhere.
+  dividendsTotal: ['PaymentsOfDividendsCommonStock', 'PaymentsOfDividends', 'DividendsPaidOrdinaryShares'],
+  preferredDividends: ['DividendsPreferredStock', 'PaymentsOfDividendsPreferredStockAndPreferenceStock'],
 };
 
 // Ordinary synonyms for capital expenditure. Anything outside this set is a
@@ -139,7 +173,7 @@ async function companyFacts(cik) {
 function resolve(facts, chain, unit) {
   const entries = [];
   chain.forEach((tag, prio) => {
-    for (const ns of ['us-gaap', 'dei']) {
+    for (const ns of NAMESPACES) {
       const found = facts[ns]?.[tag]?.units?.[unit];
       if (found?.length) entries.push(...found.map((e) => ({ ...e, tag, prio })));
     }
@@ -178,7 +212,7 @@ function dedupeByPeriod(entries, keyFn, pick = better) {
 
 function annualSeries(entries, pick = better) {
   const annual = entries.filter((e) => {
-    if (e.form !== '10-K' || !e.start) return false;
+    if (!ANNUAL_FORMS.test(e.form ?? '') || !e.start) return false;
     const days = (Date.parse(e.end) - Date.parse(e.start)) / DAY;
     return days >= 330 && days <= 400; // exclude quarterly rows carried inside a 10-K
   });
@@ -222,20 +256,55 @@ function latestInstant(entries) {
 // needs no share count and no net debt bridge — the discounted stream is the value
 // of a share directly. That lets it reuse the same projection maths as the cash flow
 // model by passing a net debt of zero against a single share.
+// Not every dividend payer tags a per-share figure. Citigroup pays roughly $5.4bn a
+// year and reports no per-share number anywhere, so the payment to common holders —
+// the total less anything owed to preferred — is divided by the share count instead.
+function derivedDividendSeries(facts) {
+  const totalRef = resolve(facts, TAGS.dividendsTotal, 'USD');
+  if (!totalRef) return null;
+
+  const dilutedRef = resolve(facts, TAGS.dilutedShares, 'shares');
+  const coverRef = resolve(facts, TAGS.coverShares, 'shares');
+  const totals = annualSeries(totalRef.entries);
+  if (!totals.length) return null;
+
+  const prefRef = resolve(facts, TAGS.preferredDividends, 'USD');
+  const preferredByEnd = new Map((prefRef ? annualSeries(prefRef.entries) : []).map((e) => [e.end, Math.abs(e.val)]));
+  const sharesByEnd = new Map((dilutedRef ? annualSeries(dilutedRef.entries) : []).map((e) => [e.end, e.val]));
+  const fallbackShares = coverRef ? latestInstant(coverRef.entries)?.val : null;
+
+  const series = [];
+  for (const t of totals) {
+    const shares = sharesByEnd.get(t.end) ?? fallbackShares;
+    if (!shares) continue;
+    const common = Math.abs(t.val) - (preferredByEnd.get(t.end) ?? 0);
+    if (!(common > 0)) continue;
+    series.push({ end: t.end, val: common / shares, tag: t.tag, filed: t.filed, form: t.form, start: t.start });
+  }
+  return series.length ? series : null;
+}
+
 function dividendPlan(facts) {
   const ref = resolve(facts, TAGS.dividendPerShare, 'USD/shares');
-  if (!ref) return null;
+  let annual = ref ? annualSeries(ref.entries, betterDividend) : [];
+  let derived = false;
+  let ttmSource = ref?.entries ?? null;
 
-  const annual = annualSeries(ref.entries, betterDividend);
-  if (!annual.length) return null;
+  if (!annual.length) {
+    const fromTotals = derivedDividendSeries(facts);
+    if (!fromTotals) return null;
+    annual = fromTotals;
+    derived = true;
+    ttmSource = null; // a derived series has no interim equivalent to roll forward
+  }
 
   const history = annual.map((e) => ({ periodEnd: e.end, dividendPerShare: e.val, tag: e.tag }));
   const latestFy = history[history.length - 1];
-  const ttmRaw = trailingTwelveMonths(ref.entries, annual[annual.length - 1], betterDividend);
+  const ttmRaw = ttmSource ? trailingTwelveMonths(ttmSource, annual[annual.length - 1], betterDividend) : null;
   const ttm = ttmRaw ? { dividendPerShare: ttmRaw.val, through: ttmRaw.through } : null;
   const avg3 = history.slice(-3).reduce((s, h) => s + h.dividendPerShare, 0) / Math.min(3, history.length);
 
-  return { history, latestFy, ttm, avg3, tag: annual[annual.length - 1].tag };
+  return { history, latestFy, ttm, avg3, derived, tag: annual[annual.length - 1].tag };
 }
 
 async function spotPrice(ticker) {
@@ -347,7 +416,24 @@ export default async function handler(req, res) {
     };
 
     let entity = { cik: match.cik, name: match.name };
-    let read1 = await read(entity);
+    let read1;
+    try {
+      read1 = await read(entity);
+    } catch (err) {
+      // Plenty of tickers in the SEC map — mostly ADRs — have a CIK but publish no
+      // XBRL facts at all. That is a limitation of the filing, not a fault here, and
+      // returning a 500 framed it as one.
+      if (/No EDGAR filings found/.test(err.message)) {
+        return res.status(422).json({
+          error: `${match.name} publishes no machine-readable financial data to EDGAR.`,
+          detail:
+            'The company is registered with the SEC but files no XBRL facts, which is common for smaller foreign listings and depositary receipts. There is nothing to value from.',
+          ticker: ticker.toUpperCase(),
+          company: match.name,
+        });
+      }
+      throw err;
+    }
     let substituted = null;
 
     // Only a filer with no annual cash flow at all is a candidate for having its
@@ -378,16 +464,34 @@ export default async function handler(req, res) {
       const dp = dividendPlan(facts);
       if (!dp) return null;
 
+      // Trinity Capital's interim distribution tags roll forward to $13.29 a share
+      // against an annual history of $2.04. A trailing figure that far from the last
+      // full year is a tagging artefact, not a real jump, so it is discarded.
+      const plausibleTtm =
+        dp.ttm && dp.latestFy.dividendPerShare > 0 &&
+        dp.ttm.dividendPerShare / dp.latestFy.dividendPerShare <= 2.5 &&
+        dp.ttm.dividendPerShare / dp.latestFy.dividendPerShare >= 0.4;
+      if (dp.ttm && !plausibleTtm) {
+        warnings.push(
+          `The trailing-twelve-month dividend implied by interim filings ($${dp.ttm.dividendPerShare.toFixed(2)}) is far from the last full year ($${dp.latestFy.dividendPerShare.toFixed(2)}), which points to inconsistent interim tagging rather than a real change. The last full year was used instead.`
+        );
+      }
+
       let base;
       let basisUsed = basis;
       let through;
-      if (basis === 'ttm' && dp.ttm) { base = dp.ttm.dividendPerShare; through = dp.ttm.through; }
+      if (basis === 'ttm' && plausibleTtm) { base = dp.ttm.dividendPerShare; through = dp.ttm.through; }
       else if (basis === 'avg3') { base = dp.avg3; through = dp.latestFy.periodEnd; basisUsed = 'avg3'; }
       else { base = dp.latestFy.dividendPerShare; basisUsed = 'lastFy'; through = dp.latestFy.periodEnd; }
-      if (basis === 'ttm' && !dp.ttm) { base = dp.latestFy.dividendPerShare; basisUsed = 'lastFy'; through = dp.latestFy.periodEnd; }
+      if (basis === 'ttm' && !plausibleTtm) { base = dp.latestFy.dividendPerShare; basisUsed = 'lastFy'; through = dp.latestFy.periodEnd; }
 
       if (!(base > 0)) return null;
       sources.dividendPerShare = dp.tag;
+      if (dp.derived) {
+        warnings.push(
+          `This filer reports no dividend per share, so the figure is derived: total dividends paid less anything owed to preferred holders, divided by the share count. It will not match a declared rate exactly.`
+        );
+      }
 
       return {
         model: 'dividend-discount',
@@ -422,6 +526,24 @@ export default async function handler(req, res) {
       }
     }
 
+    // Foreign private issuers filing 20-F report per-share amounts per ordinary share,
+    // while the security quoted in New York is a depositary receipt representing some
+    // other number of them — two for Shell, four for PDD, one for Novartis. That ratio
+    // is not in the filings, so a per-share value cannot be compared to the quoted
+    // price without being wrong by exactly that multiple, and wrong in a way that reads
+    // as a valuation signal. Canadian filers using 40-F list the common shares
+    // themselves, so they are unaffected.
+    const annualForms = new Set([...read1.ocfAnnual, ...read1.capexAnnual].map((e) => e.form));
+    if (annualForms.has('20-F') || annualForms.has('20-F/A')) {
+      return res.status(422).json({
+        error: `${entity.name} files as a foreign private issuer, and its US listing is a depositary receipt.`,
+        detail:
+          'Per-share figures in the filings are per ordinary share, while the quoted price is per depositary receipt, and the number of ordinary shares each receipt represents is not disclosed in the filings. Comparing the two would produce a valuation wrong by exactly that ratio, so no figure is given rather than a misleading one.',
+        ticker: ticker.toUpperCase(),
+        company: entity.name,
+      });
+    }
+
     if (substituted) {
       warnings.push(
         `${ticker.toUpperCase()} maps to ${substituted.from}, which has no 10-K history. Figures are taken from ${substituted.to} (CIK ${substituted.cik}), the registrant holding the filings.`
@@ -430,7 +552,7 @@ export default async function handler(req, res) {
 
     if (!plan && (!ocfAnnual.length || !capexAnnual.length)) {
       return res.status(422).json({
-        error: `No annual (10-K) cash flow history found for ${entity.name}.`,
+        error: `No annual report (10-K, 20-F or 40-F) with cash flow found for ${entity.name}.`,
         detail:
           'The ticker resolved to a SEC registrant with little or no filing history — often a recently reorganised entity — and no predecessor registrant with a 10-K history could be matched to it.',
         ticker: ticker.toUpperCase(),
@@ -563,7 +685,20 @@ export default async function handler(req, res) {
     const coverRef = resolve(facts, TAGS.coverShares, 'shares');
     const diluted = dilRef ? annualSeries(dilRef.entries).slice(-1)[0] ?? latestInstant(dilRef.entries) : null;
     const cover = coverRef ? latestInstant(coverRef.entries) : null;
-    const shares = diluted?.val ?? cover?.val;
+    // Agnico Eagle tags a diluted weighted-average of 173m against a cover-page count
+    // of 500m — the diluted figure is not the whole company. Where the two disagree by
+    // more than a factor of two the cover page is the safer denominator, since it is a
+    // simple count of shares in issue rather than a computed average.
+    let shares = diluted?.val ?? cover?.val;
+    if (diluted?.val && cover?.val) {
+      const ratio = diluted.val / cover.val;
+      if (ratio > 2 || ratio < 0.5) {
+        shares = cover.val;
+        warnings.push(
+          `Diluted share count (${(diluted.val / 1e9).toFixed(3)}bn) and cover-page count (${(cover.val / 1e9).toFixed(3)}bn) disagree by more than a factor of two; the cover-page count was used.`
+        );
+      }
+    }
     if (!shares && plan.model === 'free-cash-flow') {
       return res.status(422).json({ error: 'No share count reported in EDGAR for this filer.' });
     }
